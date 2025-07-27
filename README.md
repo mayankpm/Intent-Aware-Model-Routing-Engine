@@ -54,8 +54,8 @@ An intelligent routing system that automatically directs user queries to the mos
 ### Setup
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd routing
+git clone https://github.com/mayankpm/Intent-Aware-Model-Routing-Engine.git
+cd Intent-Aware-Model-Routing-Engine
 ```
 
 2. Install dependencies:
@@ -284,4 +284,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ---
 
-**Note**: This is a proof-of-concept implementation. For production use, additional features like authentication, rate limiting, and more robust error handling should be added. 
+**Note**: This is a proof-of-concept implementation. For production use, additional features like authentication, rate limiting, and more robust error handling should be added.
