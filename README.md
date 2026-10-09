@@ -255,6 +255,26 @@ docker run -p 8000:8000 routing-engine
 - **Accuracy**: 90%+ intent classification accuracy
 - **Cost**: Optimize for lowest cost per request while maintaining quality
 
+These are targets, not measurements. The measured numbers are below.
+
+## ⏱️ Measured: Intent Classification Latency
+
+`bench_intent.py` times `IntentClassifier.classify_intent` (keyword rules plus TF-IDF and Multinomial Naive Bayes) on 2,000 generated queries after 200 warm-up calls.
+
+```bash
+python bench_intent.py
+```
+
+Three runs on a Windows laptop (Python 3, scikit-learn 1.9):
+
+| Run | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| 1 | 0.82 ms | 0.78 ms | 0.90 ms | 1.31 ms |
+| 2 | 0.83 ms | 0.79 ms | 0.90 ms | 1.32 ms |
+| 3 | 0.83 ms | 0.80 ms | 0.90 ms | 1.27 ms |
+
+This covers intent scoring only. It does not include loading or running any LLM.
+
 ## 🔒 Security Considerations
 
 - Input validation and sanitization
