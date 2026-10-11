@@ -108,3 +108,6 @@ celerybeat.pid
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Benchmark run logs (the JSON results are committed)
+results/*.log
