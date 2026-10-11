@@ -14,6 +14,8 @@ from .model_manager import ModelManager
 from .intent_classifier import IntentClassifier
 from .model_registry import ModelRegistry
 from .prompt_manager import PromptManager
+from .backends import BackendSelection, create_backend
+from .resources import ResourceMonitor
 
 
 # Configure logging
@@ -27,52 +29,86 @@ logger = logging.getLogger(__name__)
 class RoutingApplication:
     """Main application class that orchestrates all components"""
     
-    def __init__(self, config: Optional[SystemConfig] = None):
+    def __init__(self, config: Optional[SystemConfig] = None,
+                 backend_selection: Optional[BackendSelection] = None,
+                 resource_monitor: Optional[ResourceMonitor] = None):
         self.config = config or SystemConfig()
-        
-        # Initialize components
-        self.routing_engine = RoutingEngine(self.config)
-        self.model_manager = ModelManager(max_cache_size=self.config.model_cache_size)
-        self.intent_classifier = IntentClassifier()
-        self.model_registry = ModelRegistry()
+
+        # Pick the inference backend (ROUTER_BACKEND=ollama|mock)
+        self.backend_selection = backend_selection or create_backend()
+        self.backend = self.backend_selection.backend
+
+        # Initialize components. One registry is shared so routing and
+        # execution agree on which models are available.
+        self.resource_monitor = resource_monitor or ResourceMonitor(self.backend, ttl=1.0, background=True)
+        self.model_registry = ModelRegistry(self.backend, self.resource_monitor)
+        self.routing_engine = RoutingEngine(self.config, self.model_registry)
+        self.model_manager = ModelManager(max_cache_size=self.config.model_cache_size,
+                                          backend=self.backend, registry=self.model_registry)
+        self.intent_classifier = self.routing_engine.intent_classifier
         self.prompt_manager = PromptManager()
-        
-        logger.info("Routing application initialized successfully")
+
+        logger.info(f"Routing application initialized with backend "
+                    f"'{self.backend_selection.active}' ({self.backend_selection.reason})")
     
     def process_query(self, request: QueryRequest) -> QueryResponse:
         """Process a query through the routing engine"""
-        start_time = time.time()
-        
+        start_time = time.perf_counter()
+
         try:
-            # Step 1: Get routing decision
+            # Step 1: Get routing decision (intent classification + model selection)
             routing_decision = self.routing_engine.route_query(
-                request.query, 
+                request.query,
                 user_preferences={
                     "preferred_model_size": "small",
                     "prefer_quality": False
                 }
             )
-            
+            routing_time = time.perf_counter() - start_time
+
+            model_name = routing_decision.selected_model
+            if request.force_model:
+                info = self.model_registry.get_model_info(request.force_model)
+                if info is None:
+                    raise HTTPException(status_code=400, detail=f"Unknown model: {request.force_model}")
+                if not info.is_available:
+                    raise HTTPException(status_code=400, detail=(
+                        f"Model {request.force_model} is unavailable: {info.unavailable_reason}"))
+                model_name = request.force_model
+
+            options = {}
+            if request.max_tokens is not None:
+                options["num_predict"] = request.max_tokens
+            if request.temperature is not None:
+                options["temperature"] = request.temperature
+
             # Step 2: Process query with selected model
             query_response = self.model_manager.process_query(
                 request.query,
                 routing_decision.intent,
-                routing_decision.selected_model
+                model_name,
+                context=request.context,
+                options=options,
+                routing_time=routing_time
             )
-            
+
             if not query_response:
-                raise HTTPException(status_code=500, detail="Failed to process query")
-            
+                raise HTTPException(status_code=500, detail=(
+                    f"Failed to process query: {self.model_manager.last_error or 'unknown error'}"))
+
             # Step 3: Update response with routing decision
             query_response.routing_decision = routing_decision
-            
+
             # Step 4: Calculate total processing time
-            total_time = time.time() - start_time
+            total_time = time.perf_counter() - start_time
             query_response.processing_time = total_time
-            
-            logger.info(f"Query processed successfully in {total_time:.2f}s")
+
+            logger.info(f"Query processed by {query_response.model_used} "
+                        f"({self.backend.name}) in {total_time:.2f}s")
             return query_response
-            
+
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -87,16 +123,24 @@ class RoutingApplication:
             model_stats = self.model_manager.get_performance_stats()
             
             # Get available models
-            available_models = self.model_registry.get_available_models()
-            
+            models = self.model_registry.get_available_models()
+
             # Get loaded models
             loaded_models = self.model_manager.get_loaded_models()
-            
+
+            backend = self.backend_selection.to_dict()
+            if self.backend_selection.active == "mock":
+                backend["warning"] = "MOCK BACKEND: responses are canned text, not model output"
+
             return {
                 "status": "healthy",
+                "backend": backend,
+                "resources": self.resource_monitor.snapshot(),
                 "routing_stats": routing_stats,
                 "model_stats": model_stats,
-                "available_models": [model.name for model in available_models],
+                "available_models": [model.name for model in models if model.is_available],
+                "unavailable_models": {model.name: model.unavailable_reason
+                                       for model in models if not model.is_available},
                 "loaded_models": loaded_models,
                 "config": {
                     "max_concurrent_requests": self.config.max_concurrent_requests,
@@ -144,19 +188,19 @@ async def root():
 
 
 @app.post("/query", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
+def process_query(request: QueryRequest):
     """Process a query through the routing engine"""
     return routing_app.process_query(request)
 
 
 @app.get("/status")
-async def get_status():
+def get_status():
     """Get system status and statistics"""
     return routing_app.get_system_status()
 
 
 @app.get("/models")
-async def get_models():
+def get_models():
     """Get available models"""
     models = routing_app.model_registry.get_available_models()
     return {
@@ -167,6 +211,9 @@ async def get_models():
                 "size": model.size.value,
                 "capabilities": [cap.value for cap in model.capabilities],
                 "is_available": model.is_available,
+                "unavailable_reason": model.unavailable_reason,
+                "is_llm": model.is_llm,
+                "backend_model": model.backend_model,
                 "performance_metrics": model.performance_metrics
             }
             for model in models
@@ -175,7 +222,7 @@ async def get_models():
 
 
 @app.get("/models/{model_name}")
-async def get_model_info(model_name: str):
+def get_model_info(model_name: str):
     """Get information about a specific model"""
     model_info = routing_app.model_registry.get_model_info(model_name)
     if not model_info:
@@ -187,6 +234,9 @@ async def get_model_info(model_name: str):
         "size": model_info.size.value,
         "capabilities": [cap.value for cap in model_info.capabilities],
         "is_available": model_info.is_available,
+        "unavailable_reason": model_info.unavailable_reason,
+        "is_llm": model_info.is_llm,
+        "backend_model": model_info.backend_model,
         "resource_requirements": model_info.resource_requirements,
         "performance_metrics": model_info.performance_metrics
     }
@@ -214,13 +264,13 @@ async def get_routing_stats():
 
 
 @app.get("/performance-stats")
-async def get_performance_stats():
+def get_performance_stats():
     """Get performance statistics"""
     return routing_app.model_manager.get_performance_stats()
 
 
 @app.post("/test-query")
-async def test_query(query: str, intent: Optional[str] = None):
+def test_query(query: str, intent: Optional[str] = None):
     """Test endpoint for quick query processing"""
     try:
         # Create request
@@ -235,6 +285,7 @@ async def test_query(query: str, intent: Optional[str] = None):
             "model_used": response.model_used,
             "intent_classified": response.intent_classified.value,
             "processing_time": response.processing_time,
+            "metrics": response.metrics.model_dump() if response.metrics else None,
             "routing_decision": {
                 "selected_model": response.routing_decision.selected_model,
                 "intent": response.routing_decision.intent.value,
@@ -244,6 +295,8 @@ async def test_query(query: str, intent: Optional[str] = None):
                 "estimated_cost": response.routing_decision.estimated_cost
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

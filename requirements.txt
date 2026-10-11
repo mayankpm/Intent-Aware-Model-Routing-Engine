@@ -1,29 +1,21 @@
-# Core dependencies
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
-python-dotenv==1.0.0
+# API
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2
 
-# LLM and AI dependencies
-transformers==4.35.2
-torch==2.1.1
-accelerate==0.24.1
-sentence-transformers==2.2.2
+# Intent classification
+scikit-learn>=1.3
+numpy>=1.24
 
-# Model management
-huggingface-hub==0.19.4
-tokenizers==0.15.0
-
-# Utilities
-numpy==1.24.3
-pandas==2.1.3
-scikit-learn==1.3.2
-requests==2.31.0
-
-# Monitoring and logging
-prometheus-client==0.19.0
-structlog==23.2.0
+# Inference backend (Ollama HTTP API) and resource probing
+requests>=2.31
+psutil>=5.9
+nvidia-ml-py>=12.0  # optional: fast VRAM reads; falls back to nvidia-smi
 
 # Testing
-pytest==7.4.3
-pytest-asyncio==0.21.1 
+pytest>=8
+httpx>=0.27  # FastAPI TestClient
+
+# Tested with: Python 3.12.5, fastapi 0.143.0, uvicorn 0.54.0, pydantic 2.14.0,
+# scikit-learn 1.9.1, numpy 2.5.4, requests 2.34.2, psutil 7.2.2,
+# nvidia-ml-py 13.615.71, pytest 9.1.1, httpx 0.28.1

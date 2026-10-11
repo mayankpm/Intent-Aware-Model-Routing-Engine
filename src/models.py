@@ -38,6 +38,8 @@ class QueryRequest(BaseModel):
     context: Optional[List[Dict[str, str]]] = Field(None, description="Conversation context")
     force_model: Optional[str] = Field(None, description="Force specific model selection")
     auto_custom_reasoning: bool = Field(True, description="Enable auto-selection for custom reasoning")
+    max_tokens: Optional[int] = Field(None, ge=1, description="Maximum tokens to generate (Ollama num_predict)")
+    temperature: Optional[float] = Field(None, ge=0.0, description="Sampling temperature")
 
 
 class IntentClassification(BaseModel):
@@ -58,6 +60,9 @@ class ModelInfo(BaseModel):
     performance_metrics: Dict[str, float]
     is_available: bool = True
     load_time: Optional[float] = None
+    is_llm: bool = True
+    backend_model: Optional[str] = Field(None, description="Backend model tag, e.g. the Ollama tag")
+    unavailable_reason: Optional[str] = None
 
 
 class RoutingDecision(BaseModel):
@@ -71,15 +76,33 @@ class RoutingDecision(BaseModel):
     fallback_model: Optional[str] = None
 
 
+class InferenceMetrics(BaseModel):
+    """Measured timings for one query. Fields are None when the backend does not report them."""
+    backend: str = Field(..., description="Backend that ran the query: 'ollama' or 'mock'")
+    backend_model: Optional[str] = Field(None, description="Model the backend reports it ran")
+    routing_time_ms: Optional[float] = Field(None, description="Intent classification plus model selection")
+    model_load_ms: Optional[float] = Field(None, description="Explicit load before generation, if one happened")
+    time_to_first_token_ms: Optional[float] = Field(None, description="Client-measured, request sent to first content chunk")
+    prompt_eval_ms: Optional[float] = Field(None, description="Backend-reported prompt processing time")
+    backend_load_ms: Optional[float] = Field(None, description="Backend-reported load time inside the generate call")
+    generation_ms: Optional[float] = Field(None, description="Backend-reported token generation time")
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    tokens_per_second: Optional[float] = Field(None, description="completion_tokens / generation time")
+    inference_latency_ms: Optional[float] = Field(None, description="Client-measured generate call")
+    total_latency_ms: Optional[float] = Field(None, description="Routing plus load plus inference")
+
+
 class QueryResponse(BaseModel):
     """Response from the routing engine"""
     response: str
     model_used: str
     intent_classified: IntentType
-    routing_decision: RoutingDecision
+    routing_decision: Optional[RoutingDecision] = None
     processing_time: float
     tokens_used: Optional[int] = None
     cost_estimate: Optional[float] = None
+    metrics: Optional[InferenceMetrics] = None
 
 
 class PerformanceMetrics(BaseModel):
@@ -92,6 +115,11 @@ class PerformanceMetrics(BaseModel):
     cost: float
     success: bool
     error_message: Optional[str] = None
+    backend: Optional[str] = None
+    routing_time: Optional[float] = None
+    ttft: Optional[float] = None
+    tokens_per_second: Optional[float] = None
+    completion_tokens: Optional[int] = None
 
 
 class SystemConfig(BaseModel):

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .models import IntentType, RoutingDecision, SystemConfig
 from .intent_classifier import IntentClassifier
 from .model_registry import ModelRegistry
+from .resources import model_fits
 
 
 @dataclass
@@ -21,12 +22,13 @@ class RoutingContext:
 class RoutingEngine:
     """Intelligent routing engine for selecting the best model for each query"""
     
-    def __init__(self, config: Optional[SystemConfig] = None):
+    def __init__(self, config: Optional[SystemConfig] = None,
+                 model_registry: Optional[ModelRegistry] = None):
         self.config = config or SystemConfig()
         self.intent_classifier = IntentClassifier()
-        self.model_registry = ModelRegistry()
+        self.model_registry = model_registry or ModelRegistry()
         self.routing_history = []
-    
+
     def route_query(self, query: str, user_preferences: Optional[Dict[str, Any]] = None) -> RoutingDecision:
         """Route a query to the most suitable model"""
         start_time = time.time()
@@ -60,7 +62,15 @@ class RoutingEngine:
         
         # Step 6: Make routing decision
         selected_model = self._select_best_model(context)
-        
+
+        # Step 6b: Nothing available for this intent (or nothing fits the
+        # resources): fall back to an available model rather than a name that
+        # does not exist
+        used_fallback = False
+        if selected_model is None:
+            selected_model = self.model_registry.get_fallback_model(intent_classification.intent)
+            used_fallback = selected_model is not None
+
         # Step 7: Calculate estimates
         estimated_latency = self._estimate_latency(selected_model, context)
         estimated_cost = self._estimate_cost(selected_model, context)
@@ -70,7 +80,7 @@ class RoutingEngine:
             selected_model=selected_model.name if selected_model else "fallback",
             intent=intent_classification.intent,
             confidence=intent_classification.confidence,
-            reasoning=self._generate_routing_reasoning(context, selected_model),
+            reasoning=self._generate_routing_reasoning(context, selected_model, used_fallback),
             estimated_latency=estimated_latency,
             estimated_cost=estimated_cost,
             fallback_model=self._get_fallback_model(context)
@@ -156,19 +166,12 @@ class RoutingEngine:
         ))
     
     def _apply_resource_constraints(self, models: list, context: RoutingContext) -> list:
-        """Apply resource constraints to model selection"""
-        available_ram = context.system_resources.get("available_ram_gb", 8)
-        available_cpu = context.system_resources.get("available_cpu_cores", 4)
-        
-        suitable_models = []
-        for model in models:
-            required_ram = model.resource_requirements.get("min_ram_gb", 0)
-            required_cpu = model.resource_requirements.get("cpu_cores", 1)
-            
-            if available_ram >= required_ram and available_cpu >= required_cpu:
-                suitable_models.append(model)
-        
-        return suitable_models
+        """Apply resource constraints to model selection.
+
+        Uses measured free VRAM (plus VRAM held by models the backend can
+        evict) when a GPU is present, otherwise free RAM. See resources.model_fits.
+        """
+        return [model for model in models if model_fits(model, context.system_resources)]
     
     def _estimate_latency(self, model: Any, context: RoutingContext) -> float:
         """Estimate latency for a model"""
@@ -210,19 +213,11 @@ class RoutingEngine:
         return base_cost * size_multiplier * complexity_multiplier
     
     def _get_system_resources(self) -> Dict[str, Any]:
-        """Get current system resource information"""
+        """Get current system resource information (RAM, CPU, VRAM, loaded models)"""
         try:
-            import psutil
-            
-            return {
-                "available_ram_gb": psutil.virtual_memory().available / (1024**3),
-                "total_ram_gb": psutil.virtual_memory().total / (1024**3),
-                "cpu_usage_percent": psutil.cpu_percent(),
-                "available_cpu_cores": psutil.cpu_count(),
-                "disk_usage_percent": psutil.disk_usage('/').percent
-            }
-        except ImportError:
-            # Fallback if psutil is not available
+            return self.model_registry.resource_monitor.snapshot()
+        except Exception:
+            # Fallback if probing fails
             return {
                 "available_ram_gb": 8.0,
                 "total_ram_gb": 16.0,
@@ -231,13 +226,19 @@ class RoutingEngine:
                 "disk_usage_percent": 50.0
             }
     
-    def _generate_routing_reasoning(self, context: RoutingContext, selected_model: Any) -> str:
+    def _generate_routing_reasoning(self, context: RoutingContext, selected_model: Any,
+                                    used_fallback: bool = False) -> str:
         """Generate human-readable reasoning for routing decision"""
         if not selected_model:
-            return "No suitable model available, using fallback"
-        
+            return "No model is available on the active backend"
+
         reasoning_parts = []
-        
+
+        if used_fallback:
+            reasoning_parts.append(
+                f"No available model handles {context.intent.value} within current resources; "
+                f"fell back to {selected_model.name}")
+
         # Intent-based reasoning
         reasoning_parts.append(f"Query classified as {context.intent.value} with {context.confidence:.2f} confidence")
         
@@ -262,7 +263,8 @@ class RoutingEngine:
         fallback_models = [m for m in context.available_models if m.size.value == "small"]
         if fallback_models:
             return fallback_models[0].name
-        return None
+        fallback = self.model_registry.get_fallback_model(context.intent)
+        return fallback.name if fallback else None
     
     def _log_routing_decision(self, decision: RoutingDecision, processing_time: float):
         """Log routing decision for monitoring"""

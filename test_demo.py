@@ -144,6 +144,17 @@ def test_query_processing():
                 print(f"   Confidence: {routing_decision.get('confidence', 0):.2f}")
                 print(f"   Reasoning: {routing_decision.get('reasoning', 'N/A')}")
 
+            metrics = result.get('metrics') or {}
+            if metrics:
+                tps = metrics.get('tokens_per_second')
+                ttft = metrics.get('time_to_first_token_ms')
+                print(f"   Backend: {metrics.get('backend')} ({metrics.get('backend_model')})")
+                print(f"   Routing: {metrics.get('routing_time_ms', 0):.2f} ms | "
+                      f"TTFT: {f'{ttft:.0f} ms' if ttft is not None else 'n/a'} | "
+                      f"Tokens/s: {f'{tps:.1f}' if tps else 'n/a'}")
+            snippet = (result.get('response') or '')[:100]
+            print(f"   Response: {snippet}{'...' if len(result.get('response') or '') > 100 else ''}")
+
 def test_quick_queries():
     """Test quick query endpoint"""
     print_section("Quick Query Tests")
@@ -199,8 +210,12 @@ def run_demo():
         print("❌ Server is not running. Please start the server first:")
         print("   python run.py")
         return
-    
+
     print("✅ Server is running!")
+    backend = (test_endpoint("/status") or {}).get("backend", {})
+    print(f"🔧 Inference backend: {backend.get('active', 'unknown')} ({backend.get('reason', '')})")
+    if backend.get("warning"):
+        print(f"⚠️  {backend['warning']}")
     
     # Run all tests
     tests = [

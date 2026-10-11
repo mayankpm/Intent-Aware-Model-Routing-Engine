@@ -1,9 +1,15 @@
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-import time
-import psutil
 
 from .models import ModelInfo, ModelType, ModelSize, IntentType
+from .backends import InferenceBackend
+from .resources import ResourceMonitor, model_fits
+
+# VRAM footprints below were measured with Ollama 0.40.2 on an RTX 3070 Laptop
+# GPU: size_vram from /api/ps with each model loaded alone at its default
+# context length (tinyllama 2048, phi 2048, mistral 4096). On a machine
+# without a GPU the same number is used as the RAM requirement.
+SIZE_RANK = {ModelSize.SMALL: 0, ModelSize.MEDIUM: 1, ModelSize.LARGE: 2, ModelSize.CUSTOM: 3}
 
 
 @dataclass
@@ -18,15 +24,21 @@ class ModelConfig:
     model_path: Optional[str] = None
     is_loaded: bool = False
     load_time: Optional[float] = None
+    ollama_tag: Optional[str] = None      # backend model that implements this entry
+    is_llm: bool = True                   # False for the custom reasoning placeholders
+    disabled_reason: Optional[str] = None # set to keep an entry listed but never routable
 
 
 class ModelRegistry:
     """Registry for managing available models and their capabilities"""
     
-    def __init__(self):
+    def __init__(self, backend: Optional[InferenceBackend] = None,
+                 resource_monitor: Optional[ResourceMonitor] = None):
+        self.backend = backend
+        self.resource_monitor = resource_monitor or ResourceMonitor(backend)
         self.models: Dict[str, ModelConfig] = {}
         self._initialize_models()
-    
+
     def _initialize_models(self):
         """Initialize the model registry with available models"""
         
@@ -41,15 +53,16 @@ class ModelRegistry:
                 IntentType.CONVERSATION
             ],
             resource_requirements={
-                "min_ram_gb": 4,
-                "min_vram_gb": 0,
+                "min_ram_gb": 2.09,
+                "min_vram_gb": 2.09,
                 "cpu_cores": 2
             },
             performance_metrics={
                 "latency_ms": 500,
                 "throughput_rps": 10,
                 "accuracy": 0.75
-            }
+            },
+            ollama_tag="phi"
         )
         
         self.models["tinyllama"] = ModelConfig(
@@ -62,15 +75,16 @@ class ModelRegistry:
                 IntentType.GENERAL_REASONING
             ],
             resource_requirements={
-                "min_ram_gb": 3,
-                "min_vram_gb": 0,
+                "min_ram_gb": 0.65,
+                "min_vram_gb": 0.65,
                 "cpu_cores": 2
             },
             performance_metrics={
                 "latency_ms": 600,
                 "throughput_rps": 8,
                 "accuracy": 0.70
-            }
+            },
+            ollama_tag="tinyllama"
         )
         
         # Medium Models (3B-7B parameters)
@@ -94,7 +108,9 @@ class ModelRegistry:
                 "latency_ms": 1500,
                 "throughput_rps": 5,
                 "accuracy": 0.85
-            }
+            },
+            ollama_tag=None,
+            disabled_reason="not installed: duplicates Mistral-7B and is not pulled in Ollama"
         )
         
         self.models["mistral-7b"] = ModelConfig(
@@ -109,15 +125,16 @@ class ModelRegistry:
                 IntentType.SPECIALIZED_TASKS
             ],
             resource_requirements={
-                "min_ram_gb": 8,
-                "min_vram_gb": 0,
+                "min_ram_gb": 4.61,
+                "min_vram_gb": 4.61,
                 "cpu_cores": 4
             },
             performance_metrics={
                 "latency_ms": 1200,
                 "throughput_rps": 6,
                 "accuracy": 0.88
-            }
+            },
+            ollama_tag="mistral"
         )
         
         # Large Models (7B+ parameters)
@@ -142,10 +159,14 @@ class ModelRegistry:
                 "latency_ms": 3000,
                 "throughput_rps": 3,
                 "accuracy": 0.92
-            }
+            },
+            ollama_tag=None,
+            disabled_reason="not installed: a 13B model does not fit in 8 GB of VRAM and is not pulled"
         )
         
-        # Custom Reasoning Engines
+        # Custom Reasoning Engines. These are placeholders, not LLMs: no backend
+        # implements them except the mock, which returns canned text. With the
+        # Ollama backend they are unavailable, so the router never picks them.
         self.models["business-logic-engine"] = ModelConfig(
             name="business-logic-engine",
             model_type=ModelType.CUSTOM_REASONING,
@@ -163,7 +184,8 @@ class ModelRegistry:
                 "latency_ms": 800,
                 "throughput_rps": 12,
                 "accuracy": 0.95
-            }
+            },
+            is_llm=False
         )
         
         self.models["domain-expert-engine"] = ModelConfig(
@@ -183,30 +205,30 @@ class ModelRegistry:
                 "latency_ms": 1000,
                 "throughput_rps": 10,
                 "accuracy": 0.90
-            }
+            },
+            is_llm=False
         )
     
     def get_available_models(self) -> List[ModelInfo]:
         """Get list of available models"""
-        available_models = []
-        
-        for model_name, config in self.models.items():
-            # Check if system meets requirements
-            is_available = self._check_model_availability(config)
-            
-            model_info = ModelInfo(
-                name=config.name,
-                model_type=config.model_type,
-                size=config.size,
-                capabilities=config.capabilities,
-                resource_requirements=config.resource_requirements,
-                performance_metrics=config.performance_metrics,
-                is_available=is_available,
-                load_time=config.load_time
-            )
-            available_models.append(model_info)
-        
-        return available_models
+        resources = self.resource_monitor.snapshot()
+        return [self._to_model_info(config, resources) for config in self.models.values()]
+
+    def _to_model_info(self, config: ModelConfig, resources: Dict) -> ModelInfo:
+        reason = self._unavailable_reason(config, resources)
+        return ModelInfo(
+            name=config.name,
+            model_type=config.model_type,
+            size=config.size,
+            capabilities=config.capabilities,
+            resource_requirements=config.resource_requirements,
+            performance_metrics=config.performance_metrics,
+            is_available=reason is None,
+            load_time=config.load_time,
+            is_llm=config.is_llm,
+            backend_model=config.ollama_tag,
+            unavailable_reason=reason
+        )
     
     def get_models_for_intent(self, intent: IntentType) -> List[ModelInfo]:
         """Get models that can handle a specific intent"""
@@ -231,7 +253,7 @@ class ModelRegistry:
         if prefer_small:
             # Prefer smaller models for efficiency
             suitable_models.sort(key=lambda m: (
-                m.size.value,  # Small -> Medium -> Large -> Custom
+                SIZE_RANK[m.size],  # Small -> Medium -> Large -> Custom
                 -m.performance_metrics.get("accuracy", 0),  # Higher accuracy
                 m.performance_metrics.get("latency_ms", float('inf'))  # Lower latency
             ))
@@ -249,35 +271,43 @@ class ModelRegistry:
         if model_name not in self.models:
             return None
         
-        config = self.models[model_name]
-        is_available = self._check_model_availability(config)
-        
-        return ModelInfo(
-            name=config.name,
-            model_type=config.model_type,
-            size=config.size,
-            capabilities=config.capabilities,
-            resource_requirements=config.resource_requirements,
-            performance_metrics=config.performance_metrics,
-            is_available=is_available,
-            load_time=config.load_time
-        )
-    
+        return self._to_model_info(self.models[model_name], self.resource_monitor.snapshot())
+
+    def get_fallback_model(self, intent: Optional[IntentType] = None) -> Optional[ModelInfo]:
+        """An available model to use when nothing suits ``intent``.
+
+        Tries models for the intent, then general reasoning models, then any
+        available model, preferring small ones. Returns None only when no
+        model at all is available.
+        """
+        for candidates in (
+            self.get_models_for_intent(intent) if intent else [],
+            self.get_models_for_intent(IntentType.GENERAL_REASONING),
+            [m for m in self.get_available_models() if m.is_available],
+        ):
+            if candidates:
+                return min(candidates, key=lambda m: (
+                    SIZE_RANK[m.size], -m.performance_metrics.get("accuracy", 0)))
+        return None
+
     def _check_model_availability(self, config: ModelConfig) -> bool:
-        """Check if a model can be loaded given current system resources"""
+        """Check if a model can run on the active backend with current resources"""
+        return self._unavailable_reason(config, self.resource_monitor.snapshot()) is None
+
+    def _unavailable_reason(self, config: ModelConfig, resources: Dict) -> Optional[str]:
+        if config.disabled_reason:
+            return config.disabled_reason
+        if self.backend is not None:
+            reason = self.backend.unavailable_reason(config)
+            if reason:
+                return reason
         try:
-            # Get current system resources
-            available_ram = psutil.virtual_memory().available / (1024**3)  # GB
-            cpu_count = psutil.cpu_count()
-            
-            # Check if system meets minimum requirements
-            required_ram = config.resource_requirements.get("min_ram_gb", 0)
-            required_cpu = config.resource_requirements.get("cpu_cores", 1)
-            
-            return available_ram >= required_ram and cpu_count >= required_cpu
+            if not model_fits(config, resources):
+                return "insufficient free resources (VRAM/RAM/CPU)"
         except Exception:
             # If we can't check resources, assume available
-            return True
+            pass
+        return None
     
     def update_model_status(self, model_name: str, is_loaded: bool, load_time: Optional[float] = None):
         """Update the loading status of a model"""

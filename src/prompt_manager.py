@@ -116,13 +116,12 @@ Always provide accurate, helpful, and well-structured responses."""
 - Maintaining consistency across approaches"""
         }
     
-    def generate_prompt(self, intent: IntentType, model_type: ModelType, 
-                       query: str, context: Optional[List[Dict[str, str]]] = None) -> str:
-        """Generate a complete prompt for a specific intent and model"""
-        
+    def build_system_message(self, intent: IntentType, model_type: ModelType) -> str:
+        """Build the system message shared by every prompt format"""
+
         # Get base personality
         system_parts = [self.base_personality]
-        
+
         # Add task-specific instructions
         if intent in self.task_specific_prompts:
             system_parts.append(self.task_specific_prompts[intent])
@@ -140,11 +139,27 @@ Always provide accurate, helpful, and well-structured responses."""
         system_parts.append(safety_guidelines)
         
         # Combine system message
-        system_message = "\n\n".join(system_parts)
-        
+        return "\n\n".join(system_parts)
+
+    def build_messages(self, intent: IntentType, model_type: ModelType,
+                       query: str, context: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
+        """Build chat messages (system, prior context, user) for chat-style backends"""
+        messages = [{"role": "system", "content": self.build_system_message(intent, model_type)}]
+        if context:
+            for ctx in context:
+                if "role" in ctx and "content" in ctx:
+                    messages.append({"role": ctx["role"], "content": ctx["content"]})
+        messages.append({"role": "user", "content": query})
+        return messages
+
+    def generate_prompt(self, intent: IntentType, model_type: ModelType,
+                       query: str, context: Optional[List[Dict[str, str]]] = None) -> str:
+        """Generate a complete prompt for a specific intent and model"""
+        system_message = self.build_system_message(intent, model_type)
+
         # Build the complete prompt
         prompt_parts = [f"System: {system_message}"]
-        
+
         # Add context if provided
         if context:
             for ctx in context:
