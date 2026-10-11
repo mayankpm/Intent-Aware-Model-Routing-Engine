@@ -241,8 +241,12 @@ class IRTRouter(QualityEstimator):
         return sigmoid(self._forward(d.X)[0])
 
     def difficulty(self, X):
-        """Interpretable query difficulty b_q (higher = harder)."""
-        return X @ self.wb + self.cb
+        """Query difficulty on the ability scale: b_q / |a_q|, the ability at which
+        P(correct) = 0.5 (exact for 1-D). A model with theta above it is more
+        likely right than wrong. Higher = harder."""
+        a = softplus(X @ self.Wa + self.ca)
+        a = a[:, 0] if self.D == 1 else np.linalg.norm(a, axis=1)
+        return (X @ self.wb + self.cb) / np.maximum(a, 1e-6)
 
     def to_json(self):
         return {"dims": self.D, "Wa": self.Wa.tolist(), "ca": np.atleast_1d(self.ca).tolist(),

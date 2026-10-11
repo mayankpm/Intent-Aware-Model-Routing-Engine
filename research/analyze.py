@@ -333,6 +333,8 @@ def plot(path, theme, singles, legacy_pt, oracle_pt, hull, lines, title):
         ax.plot(x, yv * 100, "o", color=pal["muted"], markersize=8, markeredgecolor=pal["surface"], markeredgewidth=2, zorder=5)
         ax.annotate(name, (x, yv * 100), xytext=(6, -3), textcoords="offset points", color=pal["ink2"], fontsize=8.5)
     for label, pt, marker in (("legacy router", legacy_pt, "s"), ("oracle", oracle_pt, "D")):
+        if pt is None:
+            continue
         ax.plot(pt[0], pt[1] * 100, marker, color=pal["ink"], markersize=7, markeredgecolor=pal["surface"], markeredgewidth=2, zorder=5)
         ax.annotate(label, pt[:1] + (pt[1] * 100,), xytext=(6, 4), textcoords="offset points", color=pal["ink"], fontsize=8.5)
     ax.set_xlabel("Mean latency per query (s), measured on RTX 3070 Laptop", color=pal["ink2"])
@@ -382,11 +384,12 @@ def main():
     cheapest_ok = np.array([min([j for j in range(M) if d.y[i, j]] or [int(np.argmin(lat_means))],
                                 key=lambda j: d.lat[i, j]) for i in range(n)])
     oracle = outcome(d, cheapest_ok)
-    leg_choice = np.array([MODELS.index(c) for c in legacy])
-    leg = outcome(d, leg_choice)
     report["oracle"] = {"accuracy": float(any_ok.mean()), "mean_latency_s": float(oracle[1])}
-    report["legacy_router"] = {"accuracy": float(leg[0]), "mean_latency_s": float(leg[1]),
-                               "choices": dict(Counter(legacy))}
+    leg = None
+    if all(c in MODELS for c in legacy):
+        leg = outcome(d, np.array([MODELS.index(c) for c in legacy]))
+        report["legacy_router"] = {"accuracy": float(leg[0]), "mean_latency_s": float(leg[1]),
+                                   "choices": dict(Counter(legacy))}
     report["classifier"] = {t: dict(Counter(x for x, tt in zip(d.intent, d.task) if tt == t)) for t in tasks}
 
     # ---- cross-validated policies
@@ -443,9 +446,10 @@ def main():
     if lam_dep is None:
         lam_dep = 0.0
     ch0 = choose(P[best_learned][0], cost, lam_dep)
+    center = float(irt_all.theta[:, 0].mean())     # only ability - difficulty matters; center for reading
     report["irt"] = {
-        "ability": {m: float(irt_all.theta[i, 0]) for i, m in enumerate(MODELS)},
-        "mean_difficulty_by_task": {t: float(diff[[j for j, x in enumerate(d.task) if x == t]].mean()) for t in tasks},
+        "ability_centered": {m: float(irt_all.theta[i, 0] - center) for i, m in enumerate(MODELS)},
+        "mean_difficulty_by_task_centered": {t: float(diff[[j for j, x in enumerate(d.task) if x == t]].mean() - center) for t in tasks},
         "spearman_difficulty_vs_prompt_words": float(np.corrcoef(np.argsort(np.argsort(diff)), np.argsort(np.argsort(words)))[0, 1]),
         "routing_by_difficulty_quintile": {
             f"Q{b + 1}": {m: float((ch0[bins == b] == i).mean()) for i, m in enumerate(MODELS)} for b in range(5)},
@@ -499,8 +503,10 @@ def print_report(r):
     for m, s in r["single_models"].items():
         print(f"| {m} | {s['accuracy']:.1%} | {s['mean_latency_s']:.2f} s | " +
               " | ".join(f"{v:.0%}" for v in s["by_task"].values()) + " |")
-    print(f"\nOracle {r['oracle']['accuracy']:.1%} at {r['oracle']['mean_latency_s']:.2f} s; legacy router "
-          f"{r['legacy_router']['accuracy']:.1%} at {r['legacy_router']['mean_latency_s']:.2f} s {r['legacy_router']['choices']}")
+    print(f"\nOracle {r['oracle']['accuracy']:.1%} at {r['oracle']['mean_latency_s']:.2f} s")
+    if "legacy_router" in r:
+        lg = r["legacy_router"]
+        print(f"Legacy router {lg['accuracy']:.1%} at {lg['mean_latency_s']:.2f} s {lg['choices']}")
     print(f"Random-mix AUC {r['random_mix_auc']:.4f}")
     print("\n| Policy | AUC | AUC - random mix | Max acc | Latency to match best model | Saving |")
     print("|---|---:|---:|---:|---:|---:|")
@@ -514,8 +520,8 @@ def print_report(r):
     for k, v in r["bootstrap_auc_diff_95ci"].items():
         print(f"  {k}: [{v[0]:+.4f}, {v[1]:+.4f}]")
     print("\nConformal cascade", r["conformal"]["small"], "->", r["conformal"]["large"], json.dumps(r["conformal"]["results"], indent=1))
-    print("\nIRT abilities", json.dumps(r["irt"]["ability"]))
-    print("Mean difficulty by task", json.dumps(r["irt"]["mean_difficulty_by_task"]))
+    print("\nIRT abilities (centered)", json.dumps(r["irt"]["ability_centered"]))
+    print("Mean difficulty by task (same scale)", json.dumps(r["irt"]["mean_difficulty_by_task_centered"]))
     print("Routing by difficulty quintile", json.dumps(r["irt"]["routing_by_difficulty_quintile"], indent=1))
     print("Deployed:", r["deployed"])
 

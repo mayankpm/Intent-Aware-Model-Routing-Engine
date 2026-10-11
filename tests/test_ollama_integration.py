@@ -79,3 +79,25 @@ def test_unload_frees_model(ollama_app):
     assert "tinyllama" in mm.get_loaded_models()
     assert mm.unload_model("tinyllama")
     assert "tinyllama" not in mm.get_loaded_models()
+
+
+def test_learned_router_on_real_models(monkeypatch):
+    """With a trained router (results/router/router.json), /query routes with the learned policy."""
+    from src.routing_policies import ARTIFACT_PATH
+    if not ARTIFACT_PATH.exists():
+        pytest.skip("no trained router; run python -m research.analyze")
+    if "all-minilm:latest" not in _pulled:
+        pytest.skip("embedding model all-minilm is not pulled")
+    monkeypatch.setenv("ROUTER_POLICY", "learned")
+    backend = OllamaBackend()
+    backend.is_reachable()
+    app = RoutingApplication(backend_selection=BackendSelection("ollama", "ollama", "test", backend))
+    assert app.learned_router is not None
+    monkeypatch.setattr(src.main, "routing_app", app)
+    body = TestClient(src.main.app).post("/query", json={"query": "What is 12 times 12? Answer: <number>",
+                                                         "max_tokens": 48, "temperature": 0}).json()
+    assert body["routing_decision"]["policy"].startswith("learned:")
+    assert body["metrics"]["backend"] == "ollama"
+    assert body["response"].strip()
+    info = app.model_registry.get_model_info(body["model_used"])
+    assert info.is_available and info.is_llm
