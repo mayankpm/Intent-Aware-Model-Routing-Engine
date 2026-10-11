@@ -345,13 +345,19 @@ This covers intent scoring only. It does not include loading or running any LLM.
 python bench_inference.py --runs 3 --num-predict 128
 ```
 
-Raw data, including every request: [`results/inference_20261011_104012.json`](results/inference_20261011_104012.json).
+Two benchmark runs (3 repeats each) are reported separately. Raw data, including every request:
+- Run A, ASUS Silent profile: [`results/inference_20261011_104012.json`](results/inference_20261011_104012.json)
+- Run B, ASUS Turbo profile: [`results/inference_20261011_110242.json`](results/inference_20261011_110242.json), with a GPU log sampled every 5 s in [`results/turbo_gpu_samples.csv`](results/turbo_gpu_samples.csv)
+
+**Both runs were heavily thermally throttled, so treat every inference number below as a lower bound, not this GPU's capability.** See [Thermal throttling](#thermal-throttling).
 
 ### Machine and setup
 
 - **Hardware:** ASUS laptop, AMD Ryzen 9 5900HS, 16 GB RAM, NVIDIA GeForce RTX 3070 Laptop GPU (8 GB VRAM, driver 595.79), Windows 11 (10.0.22631), on AC power
-- **Power mode:** ASUS **Silent** profile. Right after the run, `nvidia-smi` reported an enforced GPU power limit of 55 W, with the software thermal-slowdown and power-cap throttle reasons both active (GPU at 81 °C). These numbers describe a throttled GPU; see the note below the tables.
-- **Software:** Ollama 0.40.2, Python 3.12.5. About 6 GiB of RAM was free at the start.
+- **Power mode:**
+  - Run A used the ASUS Silent profile. Right after the run, `nvidia-smi` reported a 55 W enforced GPU power limit and a GPU temperature of 81 °C.
+  - Run B used the Turbo profile. It started with a 91 W limit at 59 °C.
+- **Software:** Ollama 0.40.2, Python 3.12.5. About 6.0 GiB (run A) and 5.6 GiB (run B) of RAM was free at the start.
 - **Models (all 4-bit, all fully on the GPU):**
 
 | Registry name | Ollama tag | Parameters | Quantization | Context | VRAM loaded (Ollama `size_vram`) |
@@ -374,7 +380,7 @@ Raw data, including every request: [`results/inference_20261011_104012.json`](re
 - **Repeats:** 3 runs. Results are not merged across runs. The summary gives the range over the 3 runs.
 - **Rounding:** throughput is rounded down; latency, overhead and memory are rounded up.
 
-### Results: ranges over 3 runs (Silent mode)
+### Run A (Silent profile): ranges over 3 runs
 
 | Model | tok/s | TTFT p50 (warm) | E2E p50 | E2E p90 | E2E p99 (max) | Router p50 | Router share of E2E | Cold load |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -401,9 +407,19 @@ VRAM (NVML delta) is the GPU's used memory with only that model loaded, minus th
 
 </details>
 
-### Routed pass (the router picks the model)
+### Run B (Turbo profile): ranges over 3 runs
 
-The same 30 prompts sent through the full application (`RoutingApplication.process_query`), with all models unloaded first.
+| Model | tok/s | TTFT p50 (warm) | E2E p50 | E2E p90 | E2E p99 (max) | Router p50 | Router share of E2E | Cold load |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| tinyllama | 136.7–226.4 | 53–55 ms | 607–882 ms | 652–1129 ms | 671–1156 ms | 1.49–1.59 ms | 0.22–0.31% | 1471–1486 ms |
+| phi-2 | 40.7–73.6 | 64–71 ms | 1465–3022 ms | 2125–3557 ms | 2223–3971 ms | 1.52–1.56 ms | 0.15–0.33% | 2484–2748 ms |
+| mistral-7b | 16.1–19.2 | 90–163 ms | 6705–8148 ms | 7249–8702 ms | 7315–8731 ms | 1.57–1.58 ms | 0.12–0.13% | 4236–4484 ms |
+
+Per-run numbers for run B are in its JSON file and in `python bench_inference.py`'s printed output.
+
+### Routed pass (the router picks the model, run A)
+
+The same 30 prompts sent through the full application (`RoutingApplication.process_query`), with all models unloaded first. Run B's routed passes sent the same 21/5/4 split, with E2E p50 of 2507, 3963 and 4035 ms.
 
 | Run | Requests routed to | E2E p50 | E2E p90 | E2E p99 (max) | Router p50 | Router share | Requests that loaded a model |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -415,7 +431,13 @@ The 3 loads per run are each model's first use. The p99 (max) request is mistral
 
 ### What these numbers do and don't show
 
-- **Throttling.** Throughput fell from run to run: phi-2 from 89.9 to 50.5 tok/s, mistral-7b from 20.7 to 16.1. The prompts, outputs and token counts were identical in every run, which points to the GPU's power and thermal limits, not to the router. Treat these as Silent-mode, throttled numbers, not this GPU's capability.
+- <a id="thermal-throttling"></a>**Thermal throttling.**
+  - Throughput fell with every repeat in both runs. In run B, phi-2 went from 73.6 to 40.7 tok/s and mistral-7b from 19.2 to 16.1. The prompts, outputs and token counts were identical every time, so the slowdown came from the hardware.
+  - Run B's GPU log shows the cause. Within a minute of starting, the enforced power limit dropped from 91 W back to 55 W, even though the Turbo profile was still selected.
+  - For the rest of the run the GPU sat in performance state P3 at 210 MHz core clock most of the time (780 MHz at most, out of a 2100 MHz maximum). Its temperature rose from 59 °C to 96 °C.
+  - The thermal-slowdown and power-cap throttle flags were active throughout.
+  - Switching to Turbo therefore did not help: the laptop's cooling, not the power profile, set the limit.
+  - Unthrottled numbers on this machine need better cooling first, then a re-run.
 - **Router overhead.** The router adds about 1.6–1.9 ms at the median, under 0.5% of end-to-end latency in every run. Its p99 reached 25.9–51.9 ms for the larger models; the spikes are rare and not yet explained (probably Python scheduling: GIL contention with the resource-monitor thread is one candidate).
 - **Not measured.** Output quality is not measured here. Throughput under concurrent requests is not measured either: the benchmark sends one request at a time.
 
