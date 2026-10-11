@@ -19,3 +19,6 @@ httpx>=0.27  # FastAPI TestClient
 # Tested with: Python 3.12.5, fastapi 0.143.0, uvicorn 0.54.0, pydantic 2.14.0,
 # scikit-learn 1.9.1, numpy 2.5.4, requests 2.34.2, psutil 7.2.2,
 # nvidia-ml-py 13.615.71, pytest 9.1.1, httpx 0.28.1
+
+# Research (research/analyze.py plots)
+matplotlib>=3.8

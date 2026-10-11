@@ -23,18 +23,31 @@ class RoutingEngine:
     """Intelligent routing engine for selecting the best model for each query"""
     
     def __init__(self, config: Optional[SystemConfig] = None,
-                 model_registry: Optional[ModelRegistry] = None):
+                 model_registry: Optional[ModelRegistry] = None,
+                 learned_router=None):
         self.config = config or SystemConfig()
         self.intent_classifier = IntentClassifier()
         self.model_registry = model_registry or ModelRegistry()
+        self.learned_router = learned_router   # src.learned_router.LearnedRouter, or None for legacy
         self.routing_history = []
 
     def route_query(self, query: str, user_preferences: Optional[Dict[str, Any]] = None) -> RoutingDecision:
         """Route a query to the most suitable model"""
+        return self.route_with_plan(query, user_preferences)[0]
+
+    def route_with_plan(self, query: str, user_preferences: Optional[Dict[str, Any]] = None):
+        """Route a query. Returns (RoutingDecision, cascade plan or None)."""
         start_time = time.time()
-        
+
         # Step 1: Classify intent
         intent_classification = self.intent_classifier.classify_intent(query)
+
+        # Learned policy (trained on measured outcomes): used when a trained router is loaded
+        if self.learned_router is not None:
+            learned = self._route_learned(query, intent_classification)
+            if learned is not None:
+                self._log_routing_decision(learned[0], time.time() - start_time)
+                return learned
         
         # Step 2: Get available models for this intent
         available_models = self.model_registry.get_models_for_intent(intent_classification.intent)
@@ -88,8 +101,39 @@ class RoutingEngine:
         
         # Step 9: Log routing decision
         self._log_routing_decision(routing_decision, time.time() - start_time)
-        
-        return routing_decision
+
+        return routing_decision, None
+
+    def _route_learned(self, query, classification):
+        """Pick by learned P(correct) minus a latency penalty among available models."""
+        available = [m.name for m in self.model_registry.get_available_models() if m.is_available and m.is_llm]
+        try:
+            choice = self.learned_router.choose(query, classification.intent.value, available)
+        except Exception as e:  # e.g. embedding model missing: fall back to the legacy policy
+            import logging
+            logging.getLogger(__name__).warning(f"Learned routing failed ({e}); using legacy policy")
+            return None
+        if choice is None:
+            return None
+        lr = self.learned_router
+        lat_ms = lr.art["latency_means_s"][lr.models.index(choice.model)] * 1000
+        p = choice.p_correct[choice.model]
+        reasoning = (f"Learned router ({lr.name}, lambda={lr.lam:g}): P(correct)={p:.2f} for {choice.model}, "
+                     f"query difficulty {choice.difficulty:+.2f}; picks the best predicted accuracy minus "
+                     f"a latency penalty among available models")
+        plan_info = None
+        if choice.cascade is not None:
+            c = choice.cascade
+            plan_info = {"small": c.small, "large": c.large, "k": c.k, "tau": c.tau}
+            reasoning += f". Probe cascade: escalate to {c.large} if P(correct) after {c.k} tokens < {c.tau:.2f}"
+        others = sorted((m for m in choice.p_correct if m != choice.model and m in available),
+                        key=lambda m: -choice.p_correct[m])
+        decision = RoutingDecision(
+            selected_model=choice.model, intent=classification.intent, confidence=classification.confidence,
+            reasoning=reasoning, estimated_latency=lat_ms, estimated_cost=0.0,
+            fallback_model=others[0] if others else None, policy=lr.name,
+            predicted_success=choice.p_correct, difficulty=choice.difficulty, cascade=plan_info)
+        return decision, choice.cascade
     
     def _select_best_model(self, context: RoutingContext) -> Optional[Any]:
         """Select the best model based on routing context"""

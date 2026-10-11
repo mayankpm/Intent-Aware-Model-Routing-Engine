@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from typing import Dict, Any, Optional
@@ -15,6 +16,7 @@ from .intent_classifier import IntentClassifier
 from .model_registry import ModelRegistry
 from .prompt_manager import PromptManager
 from .backends import BackendSelection, create_backend
+from .learned_router import LearnedRouter
 from .resources import ResourceMonitor
 
 
@@ -42,14 +44,27 @@ class RoutingApplication:
         # execution agree on which models are available.
         self.resource_monitor = resource_monitor or ResourceMonitor(self.backend, ttl=1.0, background=True)
         self.model_registry = ModelRegistry(self.backend, self.resource_monitor)
-        self.routing_engine = RoutingEngine(self.config, self.model_registry)
+        self.learned_router = self._load_learned_router()
+        self.routing_engine = RoutingEngine(self.config, self.model_registry, self.learned_router)
         self.model_manager = ModelManager(max_cache_size=self.config.model_cache_size,
                                           backend=self.backend, registry=self.model_registry)
         self.intent_classifier = self.routing_engine.intent_classifier
         self.prompt_manager = PromptManager()
 
         logger.info(f"Routing application initialized with backend "
-                    f"'{self.backend_selection.active}' ({self.backend_selection.reason})")
+                    f"'{self.backend_selection.active}' ({self.backend_selection.reason}), "
+                    f"policy '{self.learned_router.name if self.learned_router else 'legacy'}'")
+
+    def _load_learned_router(self):
+        """ROUTER_POLICY=learned (default) uses results/router/router.json when present; =legacy disables it."""
+        policy = os.getenv("ROUTER_POLICY", "learned").lower()
+        if policy == "legacy":
+            return None
+        cascade = os.getenv("ROUTER_CASCADE", "1") != "0"
+        router = LearnedRouter.load(self.backend.embed, os.getenv("ROUTER_ARTIFACT"), use_cascade=cascade)
+        if router is None:
+            logger.info("No trained router found (results/router/router.json); using legacy policy")
+        return router
     
     def process_query(self, request: QueryRequest) -> QueryResponse:
         """Process a query through the routing engine"""
@@ -57,7 +72,7 @@ class RoutingApplication:
 
         try:
             # Step 1: Get routing decision (intent classification + model selection)
-            routing_decision = self.routing_engine.route_query(
+            routing_decision, cascade_plan = self.routing_engine.route_with_plan(
                 request.query,
                 user_preferences={
                     "preferred_model_size": "small",
@@ -75,6 +90,7 @@ class RoutingApplication:
                     raise HTTPException(status_code=400, detail=(
                         f"Model {request.force_model} is unavailable: {info.unavailable_reason}"))
                 model_name = request.force_model
+                cascade_plan = None
 
             options = {}
             if request.max_tokens is not None:
@@ -89,7 +105,8 @@ class RoutingApplication:
                 model_name,
                 context=request.context,
                 options=options,
-                routing_time=routing_time
+                routing_time=routing_time,
+                cascade=cascade_plan
             )
 
             if not query_response:

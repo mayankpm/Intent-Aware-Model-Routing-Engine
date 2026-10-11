@@ -16,7 +16,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -52,6 +52,11 @@ class GenerationResult:
     load_duration_ns: Optional[int] = None
     total_duration_ns: Optional[int] = None
     done_reason: Optional[str] = None
+    # Filled when log-probabilities are requested: one entry per generated token
+    token_logprobs: Optional[List[float]] = None
+    token_top_logprobs: Optional[List[List[float]]] = None
+    token_times_s: Optional[List[float]] = None  # client-side arrival time of each token
+    aborted: bool = False                        # generation stopped early by `stop_when`
 
     @property
     def tokens_per_second(self) -> Optional[float]:
@@ -80,8 +85,19 @@ class InferenceBackend(ABC):
     @abstractmethod
     def generate(self, model, messages: List[Dict[str, str]],
                  options: Optional[Dict[str, Any]] = None,
-                 intent: Optional[IntentType] = None) -> GenerationResult:
-        """Generate a reply to chat ``messages`` (system/user/assistant dicts)."""
+                 intent: Optional[IntentType] = None, logprobs: int = 0,
+                 stop_when: Optional[Callable[["GenerationResult"], bool]] = None) -> GenerationResult:
+        """Generate a reply to chat ``messages`` (system/user/assistant dicts).
+
+        ``logprobs`` > 0 records each token's log-probability and the top
+        ``logprobs`` alternatives. ``stop_when`` is called after every token
+        with the partial result; returning True aborts generation (used by the
+        probe cascade).
+        """
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        """Sentence embeddings for the learned router. Backends without one raise."""
+        raise NotImplementedError(f"backend '{self.name}' has no embedding model")
 
     @abstractmethod
     def load(self, model) -> float:
@@ -110,9 +126,12 @@ class MockBackend(InferenceBackend):
 
     name = "mock"
 
-    def __init__(self, run_non_llm: bool = True, runnable: Optional[List[str]] = None):
+    def __init__(self, run_non_llm: bool = True, runnable: Optional[List[str]] = None,
+                 token_logprob: Optional[Dict[str, float]] = None):
         self.run_non_llm = run_non_llm
         self.runnable = set(runnable) if runnable is not None else None
+        # Per-model constant token log-probability reported when logprobs are requested (tests)
+        self.token_logprob = token_logprob or {}
         self._loaded: Dict[str, float] = {}
 
     def can_run(self, model) -> bool:
@@ -129,18 +148,35 @@ class MockBackend(InferenceBackend):
             return "not in this mock backend's runnable set"
         return "non-LLM placeholder engine; disabled in this mock configuration"
 
-    def generate(self, model, messages, options=None, intent=None) -> GenerationResult:
+    def generate(self, model, messages, options=None, intent=None, logprobs=0, stop_when=None) -> GenerationResult:
         start = time.perf_counter()
         query = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         text = self._canned_response(model.name, query, intent)
-        return GenerationResult(
-            text=text,
-            model_name=model.name,
-            backend=self.name,
-            backend_model=f"mock:{model.name}",
-            wall_time_s=time.perf_counter() - start,
-            done_reason="stop",
-        )
+        result = GenerationResult(text=text, model_name=model.name, backend=self.name,
+                                  backend_model=f"mock:{model.name}", done_reason="stop")
+        if logprobs or stop_when:
+            lp = self.token_logprob.get(model.name, -0.1)
+            result.token_logprobs, result.token_top_logprobs, result.token_times_s = [], [], []
+            for _ in text.split():
+                result.token_logprobs.append(lp)
+                result.token_top_logprobs.append([lp])
+                result.token_times_s.append(time.perf_counter() - start)
+                if stop_when and stop_when(result):
+                    result.aborted = True
+                    result.done_reason = "aborted"
+                    break
+        result.wall_time_s = time.perf_counter() - start
+        return result
+
+    def embed(self, texts):
+        """Deterministic stand-in vectors (hash-seeded), so routing tests run without a model."""
+        import hashlib
+        import random
+        out = []
+        for t in texts:
+            rng = random.Random(hashlib.sha256(t.encode()).digest())
+            out.append([rng.gauss(0, 1) for _ in range(384)])
+        return out
 
     def load(self, model) -> float:
         self._loaded[model.name] = time.time()
@@ -226,7 +262,7 @@ class OllamaBackend(InferenceBackend):
             return f"Ollama model '{tag}' is not pulled"
         return None
 
-    def generate(self, model, messages, options=None, intent=None) -> GenerationResult:
+    def generate(self, model, messages, options=None, intent=None, logprobs=0, stop_when=None) -> GenerationResult:
         payload = {
             "model": model.ollama_tag,
             "messages": messages,
@@ -234,10 +270,20 @@ class OllamaBackend(InferenceBackend):
             "keep_alive": self.keep_alive,
             "options": options or {},
         }
+        if getattr(model, "think", None) is not None:
+            payload["think"] = model.think  # Qwen3-style hybrid models: False = answer directly
+        track = bool(logprobs or stop_when)
+        if track:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = max(1, logprobs)
         start = time.perf_counter()
         ttft = None
         parts: List[str] = []
         final: Dict[str, Any] = {}
+        partial = GenerationResult(text="", model_name=model.name, backend=self.name,
+                                   backend_model=model.ollama_tag)
+        if track:
+            partial.token_logprobs, partial.token_top_logprobs, partial.token_times_s = [], [], []
         with self.session.post(f"{self.base_url}/api/chat", json=payload,
                                stream=True, timeout=self.timeout) as r:
             if r.status_code != 200:
@@ -253,12 +299,32 @@ class OllamaBackend(InferenceBackend):
                     if ttft is None:
                         ttft = time.perf_counter() - start
                     parts.append(piece)
+                if track:
+                    now = time.perf_counter() - start
+                    for lp in chunk.get("logprobs") or []:
+                        partial.token_logprobs.append(lp["logprob"])
+                        partial.token_top_logprobs.append([t["logprob"] for t in lp.get("top_logprobs") or []])
+                        partial.token_times_s.append(now)
                 if chunk.get("done"):
                     final = chunk
                     break
+                if stop_when and partial.token_logprobs:
+                    partial.text = "".join(parts)
+                    if stop_when(partial):
+                        # Leaving the `with` block closes the connection; Ollama stops generating
+                        partial.aborted = True
+                        break
         wall = time.perf_counter() - start
+        if partial.aborted:
+            partial.text = "".join(parts)
+            partial.wall_time_s, partial.ttft_s, partial.done_reason = wall, ttft, "aborted"
+            partial.eval_count = len(partial.token_logprobs)
+            return partial
         return GenerationResult(
             text="".join(parts),
+            token_logprobs=partial.token_logprobs,
+            token_top_logprobs=partial.token_top_logprobs,
+            token_times_s=partial.token_times_s,
             model_name=model.name,
             backend=self.name,
             backend_model=final.get("model", model.ollama_tag),
@@ -272,6 +338,14 @@ class OllamaBackend(InferenceBackend):
             total_duration_ns=final.get("total_duration"),
             done_reason=final.get("done_reason"),
         )
+
+    def embed(self, texts):
+        model = os.getenv("ROUTER_EMBED_MODEL", "all-minilm")
+        r = self.session.post(f"{self.base_url}/api/embed",
+                              json={"model": model, "input": list(texts), "keep_alive": self.keep_alive},
+                              timeout=60)
+        r.raise_for_status()
+        return r.json()["embeddings"]
 
     def load(self, model) -> float:
         # A generate request with no prompt loads the model and keeps it resident.

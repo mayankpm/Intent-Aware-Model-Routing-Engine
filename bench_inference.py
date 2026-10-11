@@ -25,7 +25,6 @@ import argparse
 import json
 import platform
 import statistics
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +34,7 @@ import psutil
 from src.backends import create_backend
 from src.main import RoutingApplication
 from src.models import IntentType, QueryRequest
+from src.progress import Progress
 from src.resources import GIB, GpuProbe
 
 PROMPTS = {
@@ -84,37 +84,6 @@ PROMPTS = {
 PROMPT_COUNT = sum(len(p) for p in PROMPTS.values())
 WARMUP_PROMPT = "Say hello in one short sentence."
 BENCH_MODELS = ["tinyllama", "phi-2", "mistral-7b"]
-
-
-class Progress:
-    """Progress bar with elapsed time and ETA, one line per step.
-
-    Redraws in place on a terminal; writes one line per step when stdout is a
-    file, so `Get-Content <log> -Wait` or `tail -f` shows it live.
-    """
-
-    def __init__(self, total, width=30):
-        self.total, self.width, self.done = total, width, 0
-        self.start = time.perf_counter()
-        self.tty = sys.stdout.isatty()
-
-    @staticmethod
-    def _fmt(seconds):
-        m, s = divmod(int(seconds), 60)
-        h, m = divmod(m, 60)
-        return f"{h:d}:{m:02d}:{s:02d}"
-
-    def step(self, label):
-        self.done += 1
-        elapsed = time.perf_counter() - self.start
-        frac = self.done / self.total
-        filled = int(self.width * frac)
-        eta = elapsed / self.done * (self.total - self.done)
-        line = (f"[{'#' * filled}{'.' * (self.width - filled)}] {self.done}/{self.total} "
-                f"{frac:6.1%} | elapsed {self._fmt(elapsed)} | eta {self._fmt(eta)} | {label}")
-        print(("\r" + line.ljust(120)) if self.tty else line, end="" if self.tty else "\n", flush=True)
-        if self.tty and self.done == self.total:
-            print()
 
 
 def pct(values, p):

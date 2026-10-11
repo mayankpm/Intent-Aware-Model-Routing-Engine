@@ -27,6 +27,7 @@ class ModelConfig:
     ollama_tag: Optional[str] = None      # backend model that implements this entry
     is_llm: bool = True                   # False for the custom reasoning placeholders
     disabled_reason: Optional[str] = None # set to keep an entry listed but never routable
+    think: Optional[bool] = None          # hybrid reasoning models (Qwen3): False = answer directly
 
 
 class ModelRegistry:
@@ -137,6 +138,32 @@ class ModelRegistry:
             ollama_tag="mistral"
         )
         
+        # Qwen3 models (2025). They carry no hand-set capabilities or accuracy
+        # priors: only the learned routing policies (src/routing_policies.py),
+        # which use measured outcomes, can select them. Thinking mode is off.
+        # VRAM measured with /api/ps at the default 4096 context.
+        self.models["qwen3-1.7b"] = ModelConfig(
+            name="qwen3-1.7b",
+            model_type=ModelType.OPEN_SOURCE,
+            size=ModelSize.SMALL,
+            capabilities=[],
+            resource_requirements={"min_ram_gb": 1.59, "min_vram_gb": 1.59, "cpu_cores": 2},
+            performance_metrics={},
+            ollama_tag="qwen3:1.7b",
+            think=False
+        )
+
+        self.models["qwen3-4b"] = ModelConfig(
+            name="qwen3-4b",
+            model_type=ModelType.OPEN_SOURCE,
+            size=ModelSize.MEDIUM,
+            capabilities=[],
+            resource_requirements={"min_ram_gb": 2.96, "min_vram_gb": 2.96, "cpu_cores": 4},
+            performance_metrics={},
+            ollama_tag="qwen3:4b",
+            think=False
+        )
+
         # Large Models (7B+ parameters)
         self.models["llama-2-13b"] = ModelConfig(
             name="llama-2-13b",

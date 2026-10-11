@@ -74,6 +74,10 @@ class RoutingDecision(BaseModel):
     estimated_latency: float
     estimated_cost: float
     fallback_model: Optional[str] = None
+    policy: str = Field("legacy", description="'legacy' (hand-set scores) or 'learned:<estimator>'")
+    predicted_success: Optional[Dict[str, float]] = Field(None, description="Learned P(correct) per model")
+    difficulty: Optional[float] = Field(None, description="IRT query difficulty (higher = harder)")
+    cascade: Optional[Dict[str, Any]] = Field(None, description="Planned probe cascade, if any")
 
 
 class InferenceMetrics(BaseModel):
@@ -91,6 +95,7 @@ class InferenceMetrics(BaseModel):
     tokens_per_second: Optional[float] = Field(None, description="completion_tokens / generation time")
     inference_latency_ms: Optional[float] = Field(None, description="Client-measured generate call")
     total_latency_ms: Optional[float] = Field(None, description="Routing plus load plus inference")
+    cascade: Optional[Dict[str, Any]] = Field(None, description="Probe cascade details, when one ran")
 
 
 class QueryResponse(BaseModel):

@@ -54,7 +54,7 @@ def test_performance_stats_include_metrics(client):
 def test_status_lists_available_and_unavailable(client):
     body = client.get("/status").json()
     assert body["backend"]["active"] == "mock"
-    assert set(body["available_models"]) == {"phi-2", "tinyllama", "mistral-7b"}
+    assert set(body["available_models"]) == {"phi-2", "tinyllama", "mistral-7b", "qwen3-1.7b", "qwen3-4b"}
     assert "llama-2-13b" in body["unavailable_models"]
 
 

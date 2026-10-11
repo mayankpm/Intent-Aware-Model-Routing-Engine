@@ -6,6 +6,7 @@ import pytest
 
 # src.main builds a global app at import time; keep it on the mock backend
 os.environ.setdefault("ROUTER_BACKEND", "mock")
+os.environ.setdefault("ROUTER_POLICY", "legacy")  # learned-policy tests opt in explicitly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.backends import BackendSelection, MockBackend  # noqa: E402

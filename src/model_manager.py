@@ -172,11 +172,14 @@ class ModelManager:
                      model_name: Optional[str] = None,
                      context: Optional[List[Dict[str, str]]] = None,
                      options: Optional[Dict[str, Any]] = None,
-                     routing_time: Optional[float] = None) -> Optional[QueryResponse]:
+                     routing_time: Optional[float] = None,
+                     cascade=None) -> Optional[QueryResponse]:
         """Process a query using the appropriate model.
 
         ``routing_time`` (seconds) is the time the caller spent classifying
         and selecting; it is added to the reported total latency.
+        ``cascade`` (a learned_router.CascadePlan) runs the probe cascade when
+        the selected model is the plan's small model.
         """
         start_time = time.perf_counter()
         self.last_error = None
@@ -197,7 +200,11 @@ class ModelManager:
             # Generate response
             messages = self.prompt_manager.build_messages(intent, model.model_type, query, context)
             gen_options = {**self.default_options, **(options or {})}
-            result = self.backend.generate(model, messages, gen_options, intent=intent)
+            cascade_info = None
+            if cascade is not None and model.name == cascade.small:
+                result, model, cascade_info = self._run_cascade(model, messages, gen_options, intent, cascade)
+            else:
+                result = self.backend.generate(model, messages, gen_options, intent=intent)
             if (result.load_duration_ns or 0) > 100e6:
                 # The backend (re)loaded the model during this call
                 self._refresh_resources()
@@ -205,6 +212,7 @@ class ModelManager:
             # Calculate processing time
             processing_time = time.perf_counter() - start_time
             metrics = self._build_metrics(result, routing_time, load_s, processing_time)
+            metrics.cascade = cascade_info
 
             with self.lock:
                 if model.name in self.loaded_models:
@@ -241,6 +249,38 @@ class ModelManager:
                 success=False, error_message=self.last_error, routing_time=routing_time
             )
             return None
+
+    def _run_cascade(self, small, messages, options, intent, plan):
+        """Probe cascade: stream the small model, score its first k tokens, escalate if unsure.
+
+        The probe (trained offline on token log-probabilities) gives P(small model
+        answers correctly). Below the calibrated threshold tau the stream is
+        aborted and the large model answers instead.
+        """
+        state = {"p": None}
+
+        def stop_when(partial):
+            if state["p"] is None and len(partial.token_logprobs) >= plan.k:
+                state["p"] = plan.probe.predict_one(partial.token_logprobs[:plan.k],
+                                                    partial.token_top_logprobs[:plan.k], plan.prior)
+                return state["p"] < plan.tau
+            return False
+
+        first = self.backend.generate(small, messages, options, intent=intent, logprobs=5, stop_when=stop_when)
+        if state["p"] is None:
+            # The answer ended before k tokens: decide on the tokens there are
+            state["p"] = plan.probe.predict_one(first.token_logprobs or [], first.token_top_logprobs or [], plan.prior)
+            escalate = state["p"] < plan.tau
+        else:
+            escalate = first.aborted
+        info = {"cascade_from": small.name, "cascade_to": plan.large, "k": plan.k, "tau": plan.tau,
+                "probe_p_correct": state["p"], "escalated": bool(escalate), "probe_ms": first.wall_time_s * 1000}
+        if not escalate:
+            return first, small, info
+        if not self._load_model(plan.large):
+            raise RuntimeError(f"cascade could not load {plan.large}: {self.last_error}")
+        large = self.model_registry.get_model_config(plan.large)
+        return self.backend.generate(large, messages, options, intent=intent), large, info
 
     def _build_metrics(self, result: GenerationResult, routing_time: Optional[float],
                        load_s: Optional[float], processing_time: float) -> InferenceMetrics:
