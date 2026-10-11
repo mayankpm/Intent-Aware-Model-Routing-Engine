@@ -140,7 +140,10 @@ class ModelRegistry:
         
         # Qwen3 models (2025). They carry no hand-set capabilities or accuracy
         # priors: only the learned routing policies (src/routing_policies.py),
-        # which use measured outcomes, can select them. Thinking mode is off.
+        # which use measured outcomes, can select them. Both answer directly
+        # (no thinking): qwen3:1.7b is a hybrid model with thinking switched
+        # off; for 4B the plain "qwen3:4b" tag is the thinking-only 2507
+        # release, so the non-thinking Instruct-2507 build is used instead.
         # VRAM measured with /api/ps at the default 4096 context.
         self.models["qwen3-1.7b"] = ModelConfig(
             name="qwen3-1.7b",
@@ -160,8 +163,7 @@ class ModelRegistry:
             capabilities=[],
             resource_requirements={"min_ram_gb": 2.96, "min_vram_gb": 2.96, "cpu_cores": 4},
             performance_metrics={},
-            ollama_tag="qwen3:4b",
-            think=False
+            ollama_tag="qwen3:4b-instruct-2507-q4_K_M"
         )
 
         # Large Models (7B+ parameters)
