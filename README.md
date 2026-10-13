@@ -1,34 +1,131 @@
-# Logic-Based Routing Engine for Open-Source LLMs
+# Intent-Aware Model Routing Engine
 
-An intelligent routing system that automatically directs user queries to the most suitable open-source Large Language Model (LLM) based on classified intent, then runs the query on that model locally through [Ollama](https://ollama.com). The system prioritizes cost-efficiency, latency, and context relevance while maintaining consistency across different models through carefully tuned system prompts.
+A FastAPI service that sends each query to one of several local open-source LLMs and runs it there through [Ollama](https://ollama.com). In production, a keyword and TF-IDF intent classifier plus measured free VRAM and RAM decide which model answers, and every response reports its routing time, time to first token, tokens/s and total latency. A research track asks whether a router learned from measured outcomes can predict which local model will answer a query correctly, and whether it beats simply mixing single models on the accuracy and latency frontier. The research pipeline is built and tested; its results are pending because outcome collection is not finished.
 
-## 🚀 Features
+## Status
 
-### Core Capabilities
-- **Intent Classification**: Analyzes queries to determine the most appropriate model
-- **Intelligent Routing**: Routes queries to the best model based on intent, performance, and resources (free VRAM and RAM are measured, not assumed)
-- **Real Local Inference**: Runs the selected model through Ollama (4-bit quantized TinyLlama 1.1B, Phi-2 2.7B and Mistral 7B), with a mock backend for tests and CI
-- **Custom Reasoning**: Routing hooks for domain-specific reasoning engines with auto-selection (the two engines in the registry are placeholders; see below)
-- **General Reasoning**: Standard reasoning capabilities for common tasks
-- **Model Management**: Loading, unloading and LRU caching on the backend (Ollama `keep_alive` and `/api/ps`)
-- **Measured Metrics**: Each response reports routing time, time to first token, tokens/s and total latency
-- **Performance Optimization**: Cost and latency optimization with resource constraints
-- **Consistency Framework**: Maintains uniform tone and personality across all models
+- The production router works end to end on Ollama. It currently uses the original intent policy, because no trained learned router exists yet (`results/router/router.json` is created by the analysis step).
+- The learned routing research pipeline is built and tested: evaluation set, answer checkers, outcome collector, routing policies, offline analysis, live serving and a live check.
+- Outcome collection: 992 of 1,200 records (tinyllama 240, qwen3-1.7b 240, phi-2 240, qwen3-4b 240, mistral-7b 32 of 240).
+- Analysis and results are pending. `research/analyze.py` has not been run on real data.
 
-### Intent Categories
-- **Code Generation**: Programming, debugging, algorithm implementation
-- **Creative Writing**: Story generation, content creation, creative tasks
-- **General Reasoning**: Standard logical reasoning, problem-solving, analysis
-- **Custom Reasoning**: In-house specialized reasoning engines and domain-specific logic
-- **Conversation**: Chat, Q&A, general conversation
-- **Specialized Tasks**: Translation, summarization, specific domain tasks
-- **Multi-Intent**: Complex queries requiring multiple capabilities
+## Learned routing research
 
-### Model Types
-- **Small Models** (< 3B parameters): Fast inference, low resource usage
-- **Medium Models** (3B-7B parameters): Balanced performance
-- **Large Models** (7B+ parameters): High quality, resource intensive
-- **Custom Reasoning Engines**: Domain-specific in-house models
+### The question
+
+Can a router predict which local model will answer a query correctly, and use that to beat simply mixing single models on the accuracy and latency frontier? Recent work reports that many learned routers converge to similar accuracy well below an oracle, and that task type explains most of the routing gap. This project tests those claims on small models running locally, where per-token log-probabilities and real latency are available, and adds a probe cascade that reads the small model's first tokens before deciding to escalate.
+
+### Evaluation set
+
+240 items, each checked automatically (`research/data/*.jsonl`, with per-item metadata in `research/data/item_meta.jsonl`):
+
+| Source | Items | Task type | Token budget | License |
+|---|---:|---|---:|---|
+| GSM8K test | 60 | math | 384 | MIT |
+| MBPP sanitized test split | 60 | code | 384 | CC BY 4.0 |
+| MMLU test split | 60 | knowledge (34 subjects) | 256 | MIT |
+| Hand-written (`research/build_custom.py`) | 60 | 20 instruction following, 20 specialized NLP tasks, 20 business-rule reasoning | 256 | this repo |
+
+- `research/fetch_benchmarks.py` draws fixed-seed samples (seed 2026), so re-running reproduces the same items. GSM8K comes from github.com/openai/grade-school-math; MBPP and MMLU come through the Hugging Face datasets-server API.
+- Every hand-written item carries a reference answer that must pass its own checker, and 9 of the 11 numeric items note the arithmetic behind their answer. `tests/test_research.py` checks that every reference answer passes its checker, and that every MBPP reference solution passes its own tests.
+
+### Models
+
+| Registry name | Ollama tag | Parameters (Ollama) | Quantization | Notes |
+|---|---|---|---|---|
+| tinyllama | `tinyllama` | 1B | Q4_0 | |
+| qwen3-1.7b | `qwen3:1.7b` | 2.0B | Q4_K_M | hybrid model, thinking switched off (`think=False`) |
+| phi-2 | `phi` | 3B | Q4_0 | |
+| qwen3-4b | `qwen3:4b-instruct-2507-q4_K_M` | 4.0B | Q4_K_M | non-thinking Instruct 2507 build |
+| mistral-7b | `mistral` | 7.2B | Q4_K_M | |
+
+The plain `qwen3:4b` tag now points to the thinking-only 2507 release, which ignores `think=false` and spent its whole token budget reasoning without reaching an answer. Its first 72 records were therefore invalid and are excluded from the analysis, and the registry uses the Instruct 2507 build (commit d188a37). Query embeddings come from `all-minilm` through Ollama.
+
+### Collection
+
+`research/collect.py` runs every item on every model (5 x 240 = 1,200 records):
+
+- Each query goes through the production prompt path: the `PromptManager` system prompt for the intent the production classifier assigns, then Ollama `/api/chat`.
+- Per item it records the `all-minilm` query embedding, the production intent and the legacy router's choice.
+- Per (item, model) pair it records correctness, measured latency, time to first token, Ollama's timing fields, and per-token log-probabilities (top 5) with their arrival times.
+- Temperature 0 and seed 0. The run is resumable: finished (item, model) pairs are skipped. `research/run_collect.ps1` wraps it in its own window with a progress bar and a log.
+
+### Answer checkers and the code sandbox
+
+`research/checks.py` scores each answer by type: numbers (the value after the last "Answer:" marker, else the last number), multiple-choice letters, labels, label sequences, ordered extraction, JSON keys or values, text constraints (line counts, word limits, required and forbidden words, line prefixes), and Python code run against the item's tests.
+
+Model-written code runs in a separate child interpreter: `python -I -B`, an empty temporary working directory, a 10 second timeout, and an audit hook that blocks file writes, file and directory removal or renaming, process creation (`subprocess.Popen`, `os.system`, `os.exec`, `os.spawn`, `os.startfile`), network access (`socket.connect`, `socket.bind`, `socket.getaddrinfo`, `urllib.Request`, `http.client.connect`), `ctypes` loading and calls, `input()`, and registry writes. An audit hook is a best-effort guard against accidental side effects, not a security boundary.
+
+### Routing policies
+
+Every policy in `src/routing_policies.py` estimates, for each query, the probability that each model answers it correctly, and the router picks
+
+```
+argmax_m  p_m(query) - lam * cost_m
+```
+
+where `cost_m` is the model's mean measured latency divided by the slowest model's. `lam = 0` means "most likely correct"; larger values trade accuracy for speed.
+
+| Estimator | What it uses | Line of work |
+|---|---|---|
+| `GlobalPrior` | each model's overall accuracy (no routing signal) | baseline |
+| `TaskTable` | accuracy per classified intent, or per true task type as an upper bound | "Most of the LLM Routing Gap Is Task Type" (2026) |
+| `KNNRouter` | mean outcome of the 10 nearest training queries in embedding space | "When Simple kNN Beats Complex Learned Routers" (2025) |
+| `EmbedLogReg` | one scikit-learn `LogisticRegression` per model on the query embedding | learned classifiers, e.g. RouteLLM (2024) |
+| `IRTRouter` | item response theory, 1-D and 4-D | IRT-Router (ACL 2025) |
+
+**IRT model.** A latent factor model: `logit P(model m correct on query q) = a_q . theta_m - b_q`, where the difficulty `b_q = x_q . w_b + c_b` and the discrimination `a_q = softplus(x_q W_a + c_a)` come from the query embedding `x_q`, and `theta_m` is the model's ability. The gradients are derived by hand and Adam is implemented in NumPy; `tests/test_routing_policies.py::test_irt_gradients_match_finite_differences` checks them against finite differences. Difficulty is reported as `b_q / |a_q|`, the ability at which P(correct) = 0.5, so abilities and difficulties share one scale.
+
+**Probe cascade.** The small model starts answering. After its first k tokens, a logistic model (`ProbeModel`) estimates P(small model correct) from those tokens' log-probability features (mean, minimum, share below -1, mean top-1 to top-2 margin, mean entropy over the top 5) plus the router's prior. If the estimate falls below a threshold, the small model's stream is aborted and the large model answers. `crc_threshold` sets that threshold by conformal risk control (Angelopoulos et al.). Its loss is accuracy lost relative to always using the large model, not the overall error rate: a query counts as a loss when the cascade is wrong where the large model alone would be right.
+
+### Evaluation protocol
+
+`research/analyze.py` evaluates offline by looking up each chosen model's real outcome and real measured latency in the collected records.
+
+- **Held-out scoring.** Every learned policy is scored only on queries it was not trained on: repeated R x 5-fold cross-validation (R = 10 by default), stratified by task type.
+- **Frontiers.** Each policy is swept over 60 values of `lam` (0, then 59 values spaced geometrically from 0.002 to 4) to give an accuracy against latency curve. Its Pareto envelope is compared with the upper hull of randomly mixing single models, which any useful router must beat.
+- **Summary metric.** Area under the envelope over the latency range from the fastest model to the most accurate model, that is, mean accuracy over that range of latency budgets.
+- **Uncertainty.** A paired item bootstrap (500 draws, each also picking a random cross-validation repeat) gives confidence intervals for differences between policies.
+- **Probe cascade.** Probe lengths k of 8, 16 and 32 are evaluated; the deployed default is k = 16. Cascade costs use measured probe times plus the large model's time.
+- **Conformal study.** The probe is trained on 50% of items, the threshold is calibrated on 25%, and realized loss is measured on the remaining 25%, over 100 random splits, for risk levels 0.05 and 0.10. The deployed threshold uses 0.05.
+- **Outputs.** `results/router_eval.json`, accuracy against latency plots (`results/router_frontier_light.png`, `results/router_frontier_dark.png`) and the deployable router `results/router/router.json`.
+
+### Serving and live check
+
+`src/learned_router.py` loads `results/router/router.json`, embeds the query with `all-minilm`, applies the decision rule over the models that are currently available, and returns a cascade plan when the pick is the cascade's small model. The model manager then streams the small model with log-probabilities, scores the first k tokens, and either keeps the answer or aborts the stream and runs the large model; the response's `metrics.cascade` reports what happened. If embedding fails, routing falls back to the original intent policy. `ROUTER_POLICY=legacy` turns the learned policy off.
+
+`research/live_check.py` runs a stratified sample of evaluation items (6 per task type by default) through the live learned router on Ollama, with a real aborted stream when the cascade escalates, and compares the result with what `analyze.py` simulated: routing overhead, chosen model, escalation, correctness and latency.
+
+### Reproduce
+
+Pull the research models first:
+
+```bash
+ollama pull qwen3:1.7b
+ollama pull qwen3:4b-instruct-2507-q4_K_M
+ollama pull all-minilm
+```
+
+```bash
+python -m research.fetch_benchmarks        # GSM8K, MBPP, MMLU samples (already in research/data)
+python -m research.build_custom            # the 60 hand-written items (already in research/data)
+python -m research.collect --run main      # or: pwsh -File research/run_collect.ps1 -Run main
+python -m research.analyze --run main      # cross-validation, frontiers, plots, trained router
+python -m research.live_check --run main   # live router against the simulation
+```
+
+### Results
+
+Pending. Outcome collection stands at 992 of 1,200 records (tinyllama 240, qwen3-1.7b 240, phi-2 240, qwen3-4b 240, mistral-7b 32 of 240), and the analysis has not been run. This section will report what the analysis finds, including if the learned router does not beat the simpler baselines.
+
+## Production router
+
+### How it routes
+
+- **Intent classes:** code generation, creative writing, general reasoning, custom reasoning, conversation, specialized tasks, multi-intent. `src/intent_classifier.py` combines keyword rules with a TF-IDF and Multinomial Naive Bayes classifier.
+- **Selection:** `src/routing_engine.py` scores the models whose capabilities match the intent, then keeps only models that fit current resources. With a GPU, a model fits if its measured VRAM footprint fits in free VRAM plus the VRAM held by models Ollama can evict, read through NVML (with an `nvidia-smi` fallback) and Ollama's `/api/ps`. Without a GPU, free RAM is checked instead. If nothing matches the intent, it falls back to an available model.
+- **Inference:** `src/backends.py` runs the chosen model through Ollama's streaming `/api/chat` and returns the text with Ollama's timing fields and the client-measured time to first token. A mock backend with canned responses serves tests, and the app falls back to it, with a warning in the logs and in `/status`, when Ollama is not reachable.
+- **Model management:** loading, unloading and LRU caching through Ollama's `keep_alive` and `/api/ps`.
 
 ### Models in the registry
 
@@ -37,6 +134,8 @@ An intelligent routing system that automatically directs user queries to the mos
 | `tinyllama` | `tinyllama` (1.1B, Q4_0) | runs on Ollama |
 | `phi-2` | `phi` (2.7B, Q4_0) | runs on Ollama |
 | `mistral-7b` | `mistral` (7.2B, Q4_K_M) | runs on Ollama |
+| `qwen3-1.7b` | `qwen3:1.7b` | research model: no hand-set capabilities, selected only by the learned policy |
+| `qwen3-4b` | `qwen3:4b-instruct-2507-q4_K_M` | research model: no hand-set capabilities, selected only by the learned policy |
 | `llama-2-7b` | none | listed but disabled: not pulled, duplicates Mistral-7B |
 | `llama-2-13b` | none | listed but disabled: a 13B model does not fit in 8 GB of VRAM |
 | `business-logic-engine` | none | non-LLM placeholder: only the mock backend runs it (canned text) |
@@ -44,60 +143,50 @@ An intelligent routing system that automatically directs user queries to the mos
 
 Disabled and placeholder entries are reported as unavailable (with a reason) on the Ollama backend, so the router never selects them.
 
-## 🏗️ Architecture
+**Custom reasoning.** The two custom reasoning engines are placeholders with no model behind them. Only the mock backend runs them, returning canned text; on Ollama they are unavailable, and `custom_reasoning` queries fall back to an available LLM, which the routing reasoning string states.
+
+### Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Query Input   │───▶│ Intent Classifier│───▶│ Routing Engine  │
+│   Query Input   │───>│ Intent Classifier│───>│ Routing Engine  │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                                                        │
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Model Registry │◀───│ Model Manager   │◀───│ Selected Model  │
+│  Model Registry │<───│ Model Manager   │<───│ Selected Model  │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                                                        │
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Prompt Manager  │◀───│ Response Output │◀───│ Model Processing│
+│ Prompt Manager  │<───│ Response Output │<───│ Model Processing│
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
-## 📦 Installation
+### Installation
 
-### Prerequisites
+Prerequisites:
 - Python 3.10+ (tested on 3.12.5)
-- [Ollama](https://ollama.com) for real inference, with the models pulled:
-  `ollama pull tinyllama`, `ollama pull phi`, `ollama pull mistral` (about 6.6 GB on disk)
-- An NVIDIA GPU with 8 GB of VRAM runs all three models fully on the GPU; without one, Ollama runs them on the CPU
-- Without Ollama the app still runs, on the mock backend (canned responses)
+- [Ollama](https://ollama.com) for real inference, with the models pulled: `ollama pull tinyllama`, `ollama pull phi`, `ollama pull mistral` (about 6.6 GB on disk). The research track also needs the three models listed under [Reproduce](#reproduce) (about 3.9 GB).
+- An NVIDIA GPU with 8 GB of VRAM runs all three production models fully on the GPU; without one, Ollama runs them on the CPU.
+- Without Ollama the app still runs, on the mock backend (canned responses).
 
-### Setup
-1. Clone the repository:
 ```bash
 git clone https://github.com/mayankpm/Intent-Aware-Model-Routing-Engine.git
 cd Intent-Aware-Model-Routing-Engine
-```
-
-2. Create a virtual environment and install dependencies:
-```bash
 python -m venv .venv
 .venv/Scripts/activate        # Windows; on Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Run the application with Ollama:
+Run with Ollama:
+
 ```bash
 ROUTER_BACKEND=ollama uvicorn src.main:app --port 8000
 # PowerShell: $env:ROUTER_BACKEND="ollama"; uvicorn src.main:app --port 8000
 ```
-or `python run.py`. `/status` shows which backend is active; if Ollama is not reachable the app logs a warning and uses the mock backend.
 
-The application will be available at:
-- **Main API**: http://localhost:8000
-- **API Documentation**: http://localhost:8000/docs
-- **Health Check**: http://localhost:8000/status
+or `python run.py`. The API is at http://localhost:8000, with interactive docs at `/docs`. `/status` shows which backend is active, and each routing decision names its policy.
 
-## 🎯 Usage
-
-### Basic Query Processing
+### Usage
 
 ```bash
 curl -s -X POST http://localhost:8000/query -H "Content-Type: application/json" \
@@ -116,136 +205,42 @@ The response names the model that ran and its measured metrics:
     "routing_time_ms": ..., "time_to_first_token_ms": ..., "prompt_eval_ms": ...,
     "completion_tokens": ..., "tokens_per_second": ..., "total_latency_ms": ...
   },
-  "routing_decision": {"selected_model": "phi-2", "reasoning": "...", ...}
+  "routing_decision": {"selected_model": "phi-2", "policy": "legacy", "reasoning": "...", ...}
 }
 ```
 
 Optional request fields: `force_model` (skip selection, e.g. `"mistral-7b"`), `max_tokens`, `temperature`, `context`.
 
-```python
-import requests
+`python test_demo.py` exercises a running server and prints the backend, model and metrics for each query.
 
-# Process a query
-response = requests.post("http://localhost:8000/query", json={
-    "query": "Write a Python function to calculate fibonacci numbers",
-    "user_id": "user123",
-    "auto_custom_reasoning": True
-})
+### API endpoints
 
-print(response.json())
-```
+| Method and path | Purpose |
+|---|---|
+| `POST /query` | route and answer a query |
+| `POST /test-query` | the same, with a compact response |
+| `POST /classify-intent` | intent classification only |
+| `GET /` | basic service info |
+| `GET /status` | backend, resources, available and unavailable models, statistics |
+| `GET /models`, `GET /models/{model_name}` | registry entries and availability |
+| `GET /routing-stats` | routing decision statistics |
+| `GET /performance-stats` | latency, time to first token and tokens/s, overall and per model |
 
-### Intent Classification
-
-```python
-# Classify intent of a query
-response = requests.post("http://localhost:8000/classify-intent", 
-                        params={"query": "Explain the concept of recursion"})
-
-print(response.json())
-# Output: {"intent": "general_reasoning", "confidence": 0.85, ...}
-```
-
-### System Status
-
-```python
-# Get system status and statistics
-response = requests.get("http://localhost:8000/status")
-print(response.json())
-```
-
-### Test Endpoint
-
-```python
-# Quick test query
-response = requests.post("http://localhost:8000/test-query", 
-                        params={"query": "Create a story about a robot"})
-print(response.json())
-```
-
-## 🔧 API Endpoints
-
-### Core Endpoints
-- `POST /query` - Process a query through the routing engine
-- `POST /test-query` - Quick test query processing
-- `POST /classify-intent` - Classify the intent of a query
-
-### Information Endpoints
-- `GET /` - Root endpoint with basic info
-- `GET /status` - System status and statistics
-- `GET /models` - List available models
-- `GET /models/{model_name}` - Get specific model information
-- `GET /routing-stats` - Routing statistics
-- `GET /performance-stats` - Performance statistics
-
-## 🧠 Custom Reasoning
-
-The router supports custom reasoning engines that can be automatically selected for specialized tasks. The two engines in the registry (`business-logic-engine`, `domain-expert-engine`) are placeholders with no model behind them: only the mock backend runs them, returning canned text. On the Ollama backend they are unavailable, and `custom_reasoning` queries fall back to an available LLM (the reasoning string says so).
-
-### Auto-Selection Logic
-- Detects domain-specific keywords and patterns
-- Automatically routes to custom reasoning engines when appropriate
-- Maintains fallback to general reasoning for standard tasks
-
-### Custom Engine Integration
-```python
-# Custom reasoning engines are automatically detected and used
-response = requests.post("http://localhost:8000/query", json={
-    "query": "Apply business logic to optimize the workflow process",
-    "auto_custom_reasoning": True
-})
-```
-
-## 📊 Performance Monitoring
-
-The system provides comprehensive monitoring:
-
-### Metrics Tracked
-- Model selection patterns and intent confidence
-- Routing time (classification plus selection)
-- Time to first token, prompt eval time, tokens/s (from Ollama's own timing fields)
-- End-to-end latency
-- Resource usage (RAM, CPU, VRAM)
-- Cost estimates (rough, not a real cost model)
-- Success rates
-
-### Accessing Metrics
-```python
-# Get routing statistics
-routing_stats = requests.get("http://localhost:8000/routing-stats").json()
-
-# Get performance statistics
-perf_stats = requests.get("http://localhost:8000/performance-stats").json()
-```
-
-## 🔧 Configuration
-
-### System Configuration
-The system can be configured through the `SystemConfig` class:
-
-```python
-from src.models import SystemConfig
-
-config = SystemConfig(
-    max_concurrent_requests=10,
-    model_cache_size=5,
-    enable_auto_custom_reasoning=True,
-    custom_reasoning_threshold=0.7,
-    cost_optimization_enabled=True
-)
-```
-
-### Environment Variables
+### Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `ROUTER_BACKEND` | `ollama` | `ollama` (falls back to mock if unreachable) or `mock` |
 | `OLLAMA_HOST_URL` | `http://127.0.0.1:11434` | Ollama server |
-| `ROUTER_KEEP_ALIVE` | `10m` | How long Ollama keeps a model loaded after use |
-| `ROUTER_NUM_PREDICT` | `256` | Default maximum tokens per response |
+| `ROUTER_KEEP_ALIVE` | `10m` | how long Ollama keeps a model loaded after use |
+| `ROUTER_NUM_PREDICT` | `256` | default maximum tokens per response |
+| `ROUTER_POLICY` | `learned` | `learned` uses `results/router/router.json` when it exists; `legacy` always uses the intent policy |
+| `ROUTER_CASCADE` | `1` | `0` disables the probe cascade |
+| `ROUTER_ARTIFACT` | `results/router/router.json` | path to a trained router |
+| `ROUTER_LAMBDA` | from the trained router | overrides the accuracy and latency trade-off |
+| `ROUTER_EMBED_MODEL` | `all-minilm` | embedding model for the learned router |
 
-### Model Registry
-Models can be added to the registry in `src/model_registry.py`:
+New models go in `src/model_registry.py`:
 
 ```python
 self.models["new-model"] = ModelConfig(
@@ -261,65 +256,9 @@ self.models["new-model"] = ModelConfig(
 
 `min_vram_gb` is checked against free VRAM plus VRAM held by models Ollama can evict; without a GPU, `min_ram_gb` is checked against free RAM.
 
-## 🧪 Testing
+## Measured results
 
-### Running Tests
-```bash
-pytest                 # everything; Ollama tests skip if Ollama or a model is missing
-pytest -m "not ollama" # mock backend only, no GPU needed (CI)
-pytest -m ollama       # real inference on tinyllama, phi and mistral
-```
-
-`python test_demo.py` exercises a running server and prints the backend, model and metrics for each query.
-
-### Example Test Queries
-```python
-# Code generation
-"Write a function to sort a list in Python"
-
-# Creative writing
-"Create a short story about a time traveler"
-
-# General reasoning
-"Explain the concept of machine learning"
-
-# Custom reasoning
-"Apply domain expertise to optimize the business process"
-
-# Conversation
-"Hello, how are you today?"
-
-# Specialized tasks
-"Translate this text to Spanish"
-```
-
-## 🚀 Deployment
-
-### Development
-```bash
-python run.py
-```
-
-### Production
-```bash
-# Using uvicorn directly
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 4
-
-# Using Docker (if Dockerfile is provided)
-docker build -t routing-engine .
-docker run -p 8000:8000 routing-engine
-```
-
-## 📈 Performance Targets
-
-- **Latency**: < 2 seconds for simple queries, < 5 seconds for complex queries
-- **Throughput**: 10+ concurrent requests
-- **Accuracy**: 90%+ intent classification accuracy
-- **Cost**: Optimize for lowest cost per request while maintaining quality
-
-These are targets, not measurements. The measured numbers are below.
-
-## ⏱️ Measured: Intent Classification Latency
+### Intent classification latency
 
 `bench_intent.py` times `IntentClassifier.classify_intent` (keyword rules plus TF-IDF and Multinomial Naive Bayes) on 2,000 generated queries after 200 warm-up calls.
 
@@ -337,7 +276,7 @@ Three runs on a Windows laptop (Python 3, scikit-learn 1.9):
 
 This covers intent scoring only. It does not include loading or running any LLM.
 
-## ⚡ Measured: Local Inference
+### Local inference
 
 `bench_inference.py` runs the three Ollama models through the real request path: `RoutingEngine.route_query` (classification plus selection, timed as router overhead), then `ModelManager.process_query` against Ollama's `/api/chat`.
 
@@ -351,7 +290,7 @@ Two benchmark runs (3 repeats each) are reported separately. Raw data, including
 
 **Both runs were heavily thermally throttled, so treat every inference number below as a lower bound, not this GPU's capability.** See [Thermal throttling](#thermal-throttling).
 
-### Machine and setup
+#### Machine and setup
 
 - **Hardware:** ASUS laptop, AMD Ryzen 9 5900HS, 16 GB RAM, NVIDIA GeForce RTX 3070 Laptop GPU (8 GB VRAM, driver 595.79), Windows 11 (10.0.22631), on AC power
 - **Power mode:**
@@ -366,10 +305,10 @@ Two benchmark runs (3 repeats each) are reported separately. Raw data, including
 | phi-2 | `phi:latest` (e2fd6321a5fe) | 2.7B | Q4_0 | 2048 | 2.09 GiB |
 | mistral-7b | `mistral:latest` (6577803aa9a0) | 7.2B | Q4_K_M | 4096 | 4.62 GiB |
 
-### Method
+#### Method
 
 - **Prompts:** 30 fixed prompts, 5 per intent (code, creative, general reasoning, custom reasoning, conversation, specialized tasks). Every model runs all 30.
-- **Generation:** `num_predict` 128, temperature 0, seed 42. The router's system prompt (about 300–370 tokens) goes with every request. Outputs were identical across runs: tinyllama averaged 111.9 completion tokens, phi-2 93.2, mistral-7b 107.5.
+- **Generation:** `num_predict` 128, temperature 0, seed 42. The router's system prompt (about 300 to 370 tokens) goes with every request. Outputs were identical across runs: tinyllama averaged 111.9 completion tokens, phi-2 93.2, mistral-7b 107.5.
 - **Cold start:** before each model, every model is unloaded. The first call (a fixed warm-up prompt) is reported separately as the cold start: Ollama's `load_duration`, and the client-measured time to first token.
 - **Metrics:**
   - **tok/s:** total `eval_count` / total `eval_duration` over the 30 prompts.
@@ -380,7 +319,7 @@ Two benchmark runs (3 repeats each) are reported separately. Raw data, including
 - **Repeats:** 3 runs. Results are not merged across runs. The summary gives the range over the 3 runs.
 - **Rounding:** throughput is rounded down; latency, overhead and memory are rounded up.
 
-### Run A (Silent profile): ranges over 3 runs
+#### Run A (Silent profile): ranges over 3 runs
 
 | Model | tok/s | TTFT p50 (warm) | E2E p50 | E2E p90 | E2E p99 (max) | Router p50 | Router share of E2E | Cold load |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -407,7 +346,7 @@ VRAM (NVML delta) is the GPU's used memory with only that model loaded, minus th
 
 </details>
 
-### Run B (Turbo profile): ranges over 3 runs
+#### Run B (Turbo profile): ranges over 3 runs
 
 | Model | tok/s | TTFT p50 (warm) | E2E p50 | E2E p90 | E2E p99 (max) | Router p50 | Router share of E2E | Cold load |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -417,7 +356,7 @@ VRAM (NVML delta) is the GPU's used memory with only that model loaded, minus th
 
 Per-run numbers for run B are in its JSON file and in `python bench_inference.py`'s printed output.
 
-### Routed pass (the router picks the model, run A)
+#### Routed pass (the router picks the model, run A)
 
 The same 30 prompts sent through the full application (`RoutingApplication.process_query`), with all models unloaded first. Run B's routed passes sent the same 21/5/4 split, with E2E p50 of 2507, 3963 and 4035 ms.
 
@@ -429,7 +368,7 @@ The same 30 prompts sent through the full application (`RoutingApplication.proce
 
 The 3 loads per run are each model's first use. The p99 (max) request is mistral-7b's first request, which includes its load. All three models fit in VRAM together (7.35 GiB), so no model was evicted during the pass. The prompt labels are not the classifier's output: the router sent 21 of the 30 prompts to phi-2, because phi-2 serves code, general reasoning, conversation, and custom reasoning (by fallback).
 
-### What these numbers do and don't show
+#### What these numbers do and don't show
 
 - <a id="thermal-throttling"></a>**Thermal throttling.**
   - Throughput fell with every repeat in both runs. In run B, phi-2 went from 73.6 to 40.7 tok/s and mistral-7b from 19.2 to 16.1. The prompts, outputs and token counts were identical every time, so the slowdown came from the hardware.
@@ -438,36 +377,32 @@ The 3 loads per run are each model's first use. The p99 (max) request is mistral
   - The thermal-slowdown and power-cap throttle flags were active throughout.
   - Switching to Turbo therefore did not help: the laptop's cooling, not the power profile, set the limit.
   - Unthrottled numbers on this machine need better cooling first, then a re-run.
-- **Router overhead.** The router adds about 1.6–1.9 ms at the median, under 0.5% of end-to-end latency in every run. Its p99 reached 25.9–51.9 ms for the larger models; the spikes are rare and not yet explained (probably Python scheduling: GIL contention with the resource-monitor thread is one candidate).
+- **Router overhead.** The router adds about 1.6 to 1.9 ms at the median, under 0.5% of end-to-end latency in every run. Its p99 reached 25.9 to 51.9 ms for the larger models; the spikes are rare and not yet explained (probably Python scheduling: GIL contention with the resource-monitor thread is one candidate).
 - **Not measured.** Output quality is not measured here. Throughput under concurrent requests is not measured either: the benchmark sends one request at a time.
 
-## 🔒 Security Considerations
+## Testing
 
-- Input validation and sanitization
-- Rate limiting (can be added)
-- Authentication and authorization (can be added)
-- Secure model loading and execution
-- Privacy protection for user data
+`pytest --collect-only -q` collects 113 tests. 107 run without Ollama on the mock backend; 6 are Ollama integration tests, marked `ollama`, which skip when Ollama or a required model is missing.
 
-## 🤝 Contributing
+```bash
+pytest                   # all 113; Ollama tests skip if Ollama or a model is missing
+pytest -m "not ollama"   # the 107 that need no Ollama or GPU
+pytest -m ollama         # the 6 integration tests against real models
+```
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+The suite covers routing and fallback, backend selection, the API, model lifecycle, the answer checkers and sandbox, the evaluation set's reference answers, the routing policies (including the IRT gradient check and the conformal risk guarantee on synthetic data), the analysis pipeline on synthetic data, and learned routing with the probe cascade on the mock backend.
 
-## 📄 License
+## Limitations
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+- The intent classifier is trained on synthetic keyword data, and its accuracy on real queries is not measured.
+- The two custom reasoning engines are placeholders that return canned text on the mock backend.
+- There is no authentication or rate limiting.
+- Benchmarks send one request at a time, on a laptop GPU that throttles under sustained load.
+- Learned routing results are pending: collection is incomplete and the analysis has not been run.
+- The code sandbox is a best-effort guard, not a security boundary.
 
-## 🙏 Acknowledgments
+Credits: GSM8K (MIT), MBPP (CC BY 4.0) and MMLU (MIT) supply the public evaluation items; inference runs on Ollama.
 
-- Open-source LLM community
-- FastAPI for the excellent web framework
-- Ollama and llama.cpp for local inference
-- The AI/ML community for inspiration and best practices
+## License
 
----
-
-**Note**: Routing and inference are real, but this is not production-hardened: there is no authentication or rate limiting, the intent classifier is trained on synthetic keyword data, the custom reasoning engines are placeholders, and the cost estimate is a rough formula.
+MIT. See [LICENSE](LICENSE).

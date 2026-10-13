@@ -3,8 +3,8 @@
 Three task types have no small, auto-graded public benchmark that fits this
 project, so they are written here: instruction following (20), specialized
 NLP tasks (20) and business-rule reasoning (20). Each item carries a reference
-response that must pass its own checker (validated in tests/test_research_checks.py),
-and numeric answers carry the arithmetic that produces them.
+response that must pass its own checker (validated in tests/test_research.py),
+and most numeric answers note the arithmetic behind them in a `work` field.
 
 Usage: python -m research.build_custom
 """

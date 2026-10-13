@@ -112,5 +112,5 @@ dmypy.json
 # Benchmark run logs (the JSON results are committed)
 results/*.log
 
-# In-progress collection runs are committed once complete
-research/runs/*/collect_stderr.log
+# Raw research outcomes and logs (research/collect.py) stay local
+research/runs/
