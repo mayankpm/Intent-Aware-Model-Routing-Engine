@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--run", default="main")
     ap.add_argument("--per-task", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default="router_live_check.json", help="file name under results/")
     args = ap.parse_args()
 
     sel = create_backend("ollama")
@@ -44,6 +45,7 @@ def main():
     lr = app.learned_router
     if lr is None:
         raise SystemExit("no trained router: run python -m research.analyze first")
+    MODELS[:] = lr.models                # evaluate the same model pool the router was trained on
     d, _, _, recs, _ = load_data(args.run)
     items = {it["id"]: it for it in load_items()}
     rng = np.random.default_rng(args.seed)
@@ -90,8 +92,12 @@ def main():
                       f"{'PASS' if live_ok else 'fail'} | routing {routing_s * 1000:.1f} ms")
 
     r = np.array([x["routing_ms"] for x in rows])
+    lt = np.array([x["live_total_ms"] for x in rows])
+    st = np.array([x["sim_latency_ms"] for x in rows])
     summary = {
         "items": len(rows), "policy": lr.name, "lambda": lr.lam,
+        "correctness_agreement_per_item": int(sum(x["live_ok"] == x["recorded_ok"] for x in rows)),
+        "median_latency_live_ms": float(np.median(lt)), "median_latency_simulated_ms": float(np.median(st)),
         "routing_ms": {"p50": float(np.median(r)), "p90": float(np.percentile(r, 90)), "max": float(r.max())},
         "model_agreement_live_vs_sim": float(np.mean([x["live_model"] == x["sim_model"] for x in rows])),
         "cascades_planned": int(sum(x["cascade_planned"] for x in rows)),
@@ -103,7 +109,7 @@ def main():
         "mean_latency_simulated_ms": float(np.mean([x["sim_latency_ms"] for x in rows])),
     }
     RESULTS.mkdir(exist_ok=True)
-    (RESULTS / "router_live_check.json").write_text(json.dumps({"summary": summary, "rows": rows}, indent=1))
+    (RESULTS / args.out).write_text(json.dumps({"summary": summary, "rows": rows}, indent=1))
     print(json.dumps(summary, indent=1))
 
 

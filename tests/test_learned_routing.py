@@ -96,3 +96,22 @@ def test_embedding_failure_falls_back_to_legacy(tmp_path):
     d = app.routing_engine.route_query("Write a Python function to sort a list")
     assert d.policy == "legacy"
     assert d.selected_model == "phi-2"
+
+
+def test_logreg_artifact_is_served_as_logreg(tmp_path):
+    """The deployed estimator must be the one named in the artifact (no silent substitution)."""
+    from src.routing_policies import EmbedLogReg
+    path = artifacts(tmp_path)
+    import json
+    art = json.loads(path.read_text())
+    backend = MockBackend()
+    X = normalize_rows(backend.embed([f"q{i}" for i in range(80)]))
+    y = (np.random.default_rng(1).random((80, 5)) < 0.5).astype(float)
+    d = RoutingData([str(i) for i in range(80)], MODELS, X, ["x"] * 80, ["x"] * 80, y, np.ones((80, 5)))
+    est = EmbedLogReg().fit(d)
+    art["policy"], art["estimator"] = "Embedding logistic", {"type": "logreg", **est.to_json()}
+    path.write_text(json.dumps(art))
+    lr = LearnedRouter.load(backend.embed, path)
+    assert lr.kind == "logreg" and isinstance(lr.est, EmbedLogReg)
+    q = RoutingData(["q"], MODELS, normalize_rows(backend.embed(["hello"])), ["x"], ["x"], np.zeros((1, 5)), np.zeros((1, 5)))
+    assert np.allclose(lr.est.predict(q), est.predict(q))

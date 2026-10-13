@@ -128,3 +128,10 @@ def test_irt_json_round_trip():
     irt = IRTRouter(dims=2, steps=50).fit(d)
     again = IRTRouter.from_json(irt.to_json())
     assert np.allclose(again.predict(d), irt.predict(d))
+
+
+def test_embed_logreg_json_round_trip():
+    d, _, _ = synthetic(150)
+    lr = EmbedLogReg().fit(d)
+    again = EmbedLogReg.from_json(lr.to_json())
+    assert np.allclose(again.predict(d), lr.predict(d))

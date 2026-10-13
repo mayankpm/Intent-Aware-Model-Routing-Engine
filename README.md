@@ -1,13 +1,12 @@
 # Intent-Aware Model Routing Engine
 
-A FastAPI service that sends each query to one of several local open-source LLMs and runs it there through [Ollama](https://ollama.com). In production, a keyword and TF-IDF intent classifier plus measured free VRAM and RAM decide which model answers, and every response reports its routing time, time to first token, tokens/s and total latency. A research track asks whether a router learned from measured outcomes can predict which local model will answer a query correctly, and whether it beats simply mixing single models on the accuracy and latency frontier. The research pipeline is built and tested; its results are pending because outcome collection is not finished.
+A FastAPI service that sends each query to one of several local open-source LLMs and runs it there through [Ollama](https://ollama.com). In production, a keyword and TF-IDF intent classifier plus measured free VRAM and RAM decide which model answers, and every response reports its routing time, time to first token, tokens/s and total latency. A research track asks whether a router learned from measured outcomes can predict which local model will answer a query correctly, and whether it beats simply mixing single models on the accuracy and latency frontier. On 240 auto-graded queries and four local models, one learned router (logistic regression on query embeddings) beats random mixing with a 95% confidence interval above zero, but no router beats always calling the strongest model, the probe cascade does not pay off, and knowing the true task type would help more than any learned router.
 
 ## Status
 
-- The production router works end to end on Ollama. It currently uses the original intent policy, because no trained learned router exists yet (`results/router/router.json` is created by the analysis step).
-- The learned routing research pipeline is built and tested: evaluation set, answer checkers, outcome collector, routing policies, offline analysis, live serving and a live check.
-- Outcome collection: 992 of 1,200 records (tinyllama 240, qwen3-1.7b 240, phi-2 240, qwen3-4b 240, mistral-7b 32 of 240).
-- Analysis and results are pending. `research/analyze.py` has not been run on real data.
+- The production router works end to end on Ollama. With the trained router in `results/router/router.json` it uses the learned policy by default (`ROUTER_POLICY=legacy` restores the original intent policy).
+- The learned routing research pipeline is built and tested: evaluation set, answer checkers, outcome collector, routing policies, offline analysis, live serving and live checks.
+- Results below cover four models with all 240 items each (tinyllama, qwen3-1.7b, phi-2, qwen3-4b). Mistral-7B is excluded: its collection is incomplete (113 of 240 items), stopped early because on the throttled laptop GPU each Mistral query was taking tens of seconds.
 
 ## Learned routing research
 
@@ -110,13 +109,71 @@ ollama pull all-minilm
 python -m research.fetch_benchmarks        # GSM8K, MBPP, MMLU samples (already in research/data)
 python -m research.build_custom            # the 60 hand-written items (already in research/data)
 python -m research.collect --run main      # or: pwsh -File research/run_collect.ps1 -Run main
-python -m research.analyze --run main      # cross-validation, frontiers, plots, trained router
+python -m research.analyze --run main --models tinyllama qwen3-1.7b phi-2 qwen3-4b
 python -m research.live_check --run main   # live router against the simulation
+python -m research.eviction_check          # which models Ollama keeps resident, and reload cost
+python -m research.report_tables           # the tables below, from results/*.json
 ```
+
+`pwsh -File research/run_analyze.ps1 -Run main -Models tinyllama,qwen3-1.7b,phi-2,qwen3-4b` runs the analysis, the three live checks and the residency check in one window.
 
 ### Results
 
-Pending. Outcome collection stands at 992 of 1,200 records (tinyllama 240, qwen3-1.7b 240, phi-2 240, qwen3-4b 240, mistral-7b 32 of 240), and the analysis has not been run. This section will report what the analysis finds, including if the learned router does not beat the simpler baselines.
+Four models, 240 items each, scored by 10 x 5-fold cross-validation (every number below is for queries the router was not trained on, except where marked descriptive). Every figure is printed by `python -m research.report_tables` from [`results/router_eval.json`](results/router_eval.json) and the live check files. Accuracies and gains are rounded down, latencies rounded up, and confidence intervals rounded outward. Latencies were measured on the same throttled laptop GPU as the benchmarks below, so treat them as relative, not absolute.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/router_frontier_dark.png">
+  <img alt="Accuracy against mean latency for four routing policies, the four single models, the random mix of single models and the oracle" src="results/router_frontier_light.png">
+</picture>
+
+**Single models.**
+
+| Model | Correct of 240 | Accuracy | Mean latency | business rules | code | instruction | knowledge | math | specialized |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| tinyllama | 36 | 15.0% | 0.94 s | 25.0% | 11.6% | 15.0% | 20.0% | 1.6% | 40.0% |
+| qwen3-1.7b | 153 | 63.7% | 2.44 s | 75.0% | 61.6% | 80.0% | 46.6% | 70.0% | 75.0% |
+| phi-2 | 121 | 50.4% | 2.28 s | 50.0% | 35.0% | 50.0% | 61.6% | 41.6% | 90.0% |
+| qwen3-4b | 190 | 79.1% | 3.31 s | 90.0% | 86.6% | 90.0% | 61.6% | 75.0% | 100.0% |
+
+An oracle that picks the cheapest model that answers correctly reaches 88.3% at 1.41 s, so the gap a router could close is real.
+
+**Routing policies.** AUC is mean accuracy over latency budgets from the fastest model (0.94 s) to the most accurate (3.31 s); the random mix of single models scores 0.5111.
+
+| Policy | AUC | AUC minus random mix | 95% interval vs random mix | 95% interval vs intent table | Accuracy at qwen3-1.7b latency | Best accuracy |
+|---|---:|---:|---:|---:|---:|---:|
+| Embedding logistic | 0.5506 | +0.0394 | [+0.006, +0.084] | [+0.024, +0.114] | 71.6% | 78.1% |
+| IRT 4-D | 0.5398 | +0.0286 | [-0.014, +0.072] | [+0.004, +0.109] | 68.3% | 76.4% |
+| kNN (k=10) | 0.5125 | +0.0013 | [-0.038, +0.041] | [-0.023, +0.082] | 67.4% | 76.6% |
+| IRT 1-D | 0.4855 | -0.0257 | [-0.065, +0.010] | [-0.044, +0.050] | 58.3% | 79.1% |
+| Task table (classified intent) | 0.4787 | -0.0325 | [-0.074, +0.020] | n/a | 70.3% | 79.1% |
+| Task table (true task type) | 0.6144 | +0.1032 | n/a | n/a | 77.0% | 77.3% |
+| IRT + probe cascade | 0.4685 | -0.0427 | n/a | n/a | 52.9% | 79.1% |
+| Cascade tinyllama to qwen3-4b (k=16) | 0.3487 | -0.1624 | n/a | n/a | 31.4% | 79.1% |
+| Cascade qwen3-1.7b to qwen3-4b (k=16) | 0.2446 | -0.2666 | n/a | n/a | 63.7% | 79.1% |
+| Cascade phi-2 to qwen3-4b (k=16) | 0.2525 | -0.2587 | n/a | n/a | 54.7% | 79.1% |
+
+What this shows:
+
+- **One learned router beats random mixing, and none beats the best model.** Logistic regression on the query embedding is the only policy whose interval against random mixing excludes zero. At qwen3-1.7b's latency budget it reaches 71.6% against qwen3-1.7b's 63.7%, and at phi-2's budget 70.5% against phi-2's 50.4%. No policy reaches qwen3-4b's 79.1% at a lower latency, so the deployed router, chosen by the rule "lowest latency that matches the best single model, else the most accurate setting", runs at lambda 0 and sends nearly every query to qwen3-4b. `ROUTER_LAMBDA` selects other points on the curve.
+- **Task type carries most of the routing signal, and the production classifier misses it.** A table keyed on the true task type has the highest AUC of all (+0.1032 over random mixing), in line with recent work that attributes most of the routing gap to task type. The same table keyed on the production classifier's label falls below random mixing. The classifier labels 13 of 20 business-rule prompts and 8 of 20 instruction prompts as code generation.
+- **kNN and IRT do not beat random mixing here.** kNN sits on the random-mix line. 4-D IRT beats the intent table but its interval against random mixing includes zero; 1-D IRT does neither. With 240 queries, many of these differences are within noise.
+- **The probe cascade does not pay off.** Every cascade sits below random mixing. tinyllama is too weak (15.0%) for its early tokens to save much, and phi-2 (2.28 s) and qwen3-1.7b (2.44 s) are not much cheaper than qwen3-4b (3.31 s), so probing then escalating costs more than it saves.
+- **The conformal guarantee held, at the expected price.** Calibrating the tinyllama to qwen3-4b escalation threshold for a 0.05 risk of lost accuracy gave a mean realized loss of 0.045 over 100 held-out splits (0.094 at a 0.10 target). Risk control bounds the mean, not every split: 28% and 31% of splits exceeded their target. To stay within the bound the cascade escalated 93% and 87% of queries, saving 0.5% and 5.4% of latency.
+
+**Query difficulty (descriptive, IRT fit on all items).** Model abilities, centered: tinyllama -1.54, phi-2 -0.07, qwen3-1.7b 0.44, qwen3-4b 1.16, the same order as their accuracies. Mean difficulty on the same scale is lowest for specialized tasks (-1.01) and highest for knowledge (0.21); difficulty and prompt length have a Spearman correlation of 0.47. At the mid-frontier operating point (embedding logistic, lambda 0.5602, 70.5% accuracy at 2.12 s), the share of queries sent to qwen3-4b is 25% for the easiest fifth by difficulty and 43% to 46% for the other four fifths, so harder queries do go to the larger model, but the trend is mostly the easiest fifth against the rest.
+
+**Live checks.** `research/live_check.py` ran 36 items (6 per task type) through the live router on Ollama, three times:
+
+| Run | lambda | Routing p50 | Routing p90 | Same model as simulation | Cascades planned | Escalated live | Same correctness as recorded | Identical text | Median latency live | Median simulated |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| deployed | 0 | 36.2 ms | 54.6 ms | 36 of 36 | 0 | 0 | 32 of 36 | 17 of 36 | 1156 ms | 1207 ms |
+| mid-frontier | 0.5602 | 32.7 ms | 48.7 ms | 36 of 36 | 0 | 0 | 32 of 36 | 18 of 36 | 1645 ms | 886 ms |
+| cascade forced | 50 | 39.2 ms | 75.6 ms | 34 of 36 | 36 | 34 | 32 of 36 | 18 of 36 | 2955 ms | 1760 ms |
+
+- **Routing overhead.** The learned router's median overhead is 32.7 ms to 39.2 ms, mostly the embedding call, against about 1.5 ms to 1.9 ms for the intent router in the benchmarks below.
+- **Decisions match the simulation.** The live router chose the simulated model on every item, and in the forced cascade run the live probe agreed with the simulated escalation decision on 34 of 36 items (34 live escalations).
+- **Outputs are not exactly reproducible.** Despite temperature 0 and a fixed seed, only 17 or 18 of 36 answers were identical to the recorded text, and correctness matched on 32 of 36 in each run.
+- **Live latency can exceed the simulation.** At the mid-frontier point the live median was 1645 ms against 886 ms simulated. `research/eviction_check.py` measured one cause ([`results/ollama_eviction_check.json`](results/ollama_eviction_check.json)): Ollama kept at most 3 models resident, so with the embedding model loaded, routing among three LLMs forced reloads of 3.9 s to 8.1 s. The simulation, built from runs where each model ran alone, does not model this. The gap in the forced cascade run is not yet explained; the GPU's thermal state was not logged during the live checks.
 
 ## Production router
 
@@ -198,14 +255,14 @@ The response names the model that ran and its measured metrics:
 ```json
 {
   "response": "...",
-  "model_used": "phi-2",
+  "model_used": "qwen3-4b",
   "intent_classified": "code_generation",
   "metrics": {
-    "backend": "ollama", "backend_model": "phi",
+    "backend": "ollama", "backend_model": "qwen3:4b-instruct-2507-q4_K_M",
     "routing_time_ms": ..., "time_to_first_token_ms": ..., "prompt_eval_ms": ...,
     "completion_tokens": ..., "tokens_per_second": ..., "total_latency_ms": ...
   },
-  "routing_decision": {"selected_model": "phi-2", "policy": "legacy", "reasoning": "...", ...}
+  "routing_decision": {"selected_model": "qwen3-4b", "policy": "learned:Embedding logistic", "reasoning": "...", ...}
 }
 ```
 
@@ -382,11 +439,11 @@ The 3 loads per run are each model's first use. The p99 (max) request is mistral
 
 ## Testing
 
-`pytest --collect-only -q` collects 113 tests. 107 run without Ollama on the mock backend; 6 are Ollama integration tests, marked `ollama`, which skip when Ollama or a required model is missing.
+`pytest --collect-only -q` collects 115 tests. 109 run without Ollama on the mock backend; 6 are Ollama integration tests, marked `ollama`, which skip when Ollama or a required model is missing. With Ollama running and the trained router present, all 115 passed.
 
 ```bash
-pytest                   # all 113; Ollama tests skip if Ollama or a model is missing
-pytest -m "not ollama"   # the 107 that need no Ollama or GPU
+pytest                   # all 115; Ollama tests skip if Ollama or a model is missing
+pytest -m "not ollama"   # the 109 that need no Ollama or GPU
 pytest -m ollama         # the 6 integration tests against real models
 ```
 
@@ -398,7 +455,9 @@ The suite covers routing and fallback, backend selection, the API, model lifecyc
 - The two custom reasoning engines are placeholders that return canned text on the mock backend.
 - There is no authentication or rate limiting.
 - Benchmarks send one request at a time, on a laptop GPU that throttles under sustained load.
-- Learned routing results are pending: collection is incomplete and the analysis has not been run.
+- The research uses 240 queries and four models, so many differences between routers are within noise; Mistral-7B is excluded because its collection is incomplete (113 of 240).
+- Live answers are not exactly reproducible at temperature 0 on this setup, and live latency can exceed the offline simulation when Ollama has to reload models.
+- The deployed learned router adds roughly 30 ms to 40 ms of routing overhead per query, mostly the embedding call.
 - The code sandbox is a best-effort guard, not a security boundary.
 
 Credits: GSM8K (MIT), MBPP (CC BY 4.0) and MMLU (MIT) supply the public evaluation items; inference runs on Ollama.

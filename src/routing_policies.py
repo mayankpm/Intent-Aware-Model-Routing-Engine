@@ -174,8 +174,32 @@ class EmbedLogReg(QualityEstimator):
         return self
 
     def predict(self, d):
-        cols = [np.full(len(d.X), c) if isinstance(c, float) else c.predict_proba(d.X)[:, 1] for c in self.clfs]
+        cols = []
+        for c in self.clfs:
+            if isinstance(c, float):
+                cols.append(np.full(len(d.X), c))
+            elif isinstance(c, tuple):                       # loaded from JSON: (coef, intercept)
+                cols.append(sigmoid(d.X @ c[0] + c[1]))
+            else:
+                cols.append(c.predict_proba(d.X)[:, 1])
         return np.stack(cols, 1)
+
+    def to_json(self):
+        out = []
+        for c in self.clfs:
+            if isinstance(c, float):
+                out.append({"const": c})
+            elif isinstance(c, tuple):
+                out.append({"coef": c[0].tolist(), "intercept": float(c[1])})
+            else:
+                out.append({"coef": c.coef_[0].tolist(), "intercept": float(c.intercept_[0])})
+        return {"C": self.C, "models": out}
+
+    @classmethod
+    def from_json(cls, j):
+        r = cls(C=j["C"])
+        r.clfs = [m["const"] if "const" in m else (np.array(m["coef"]), float(m["intercept"])) for m in j["models"]]
+        return r
 
 
 class IRTRouter(QualityEstimator):

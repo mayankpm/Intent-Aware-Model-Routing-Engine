@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .routing_policies import (IRTRouter, ProbeModel, RoutingData, TaskTable, KNNRouter,
+from .routing_policies import (EmbedLogReg, IRTRouter, ProbeModel, RoutingData, TaskTable, KNNRouter,
                                choose, latency_cost, load_artifacts, normalize_rows)
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ class LearnedRouter:
             self.est = KNNRouter(est["k"], est["temperature"])
             self.est.X, self.est.y = np.array(est["X"]), np.array(est["y"])
             self.est.prior = (self.est.y.sum(0) + 1) / (len(self.est.y) + 2)
+        elif self.kind == "logreg":
+            self.est = EmbedLogReg.from_json(est)
         elif self.kind == "table":
             self.est = TaskTable(est["key"])
             self.est.table = {k: np.array(v) for k, v in est["table"].items()}

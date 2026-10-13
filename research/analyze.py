@@ -241,6 +241,33 @@ def cascade_curves(d, P_ok, best_model, irt_P, cost):
     return out
 
 
+def bootstrap_auc_vs_mix(d, P, name, cost, lo, hi, B=500, seed=0):
+    """Paired item bootstrap of AUC(policy) - AUC(random mix of single models).
+
+    Each draw resamples items, recomputes the single-model points and their
+    upper hull on those items, and uses a random cross-validation repeat.
+    """
+    rng = np.random.default_rng(seed)
+    n, M = d.y.shape
+    R = P[name].shape[0]
+    ch = np.stack([np.stack([choose(P[name][r], cost, lam) for lam in LAMBDAS]) for r in range(R)])
+    diffs = []
+    for _ in range(B):
+        rows = rng.integers(0, n, n)
+        r = rng.integers(0, R)
+        c = ch[r][:, rows]
+        env = envelope(list(zip(d.lat[rows[None, :], c].mean(1), d.y[rows[None, :], c].mean(1))))
+        hull = upper_hull([(float(d.lat[rows, m].mean()), float(d.y[rows, m].mean())) for m in range(M)])
+        diffs.append(auc(env, lo, hi) - auc(hull, lo, hi, interpolate=True))
+    return float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))
+
+
+def accuracy_at_budget(env, budget):
+    """Best envelope accuracy with mean latency at or under the budget (None if none)."""
+    ok = [a for l, a in env if l <= budget + 1e-12]
+    return max(ok) if ok else None
+
+
 def bootstrap_auc_diff(d, P, a, b, cost, lo, hi, B=500, seed=0):
     """Paired item bootstrap of AUC(a) - AUC(b); each draw also picks a random CV repeat."""
     rng = np.random.default_rng(seed)
@@ -320,18 +347,19 @@ def plot(path, theme, singles, legacy_pt, oracle_pt, hull, lines, title):
         ax.spines[side].set_color(pal["axis"])
     ax.tick_params(colors=pal["muted"])
     hx, hy = zip(*hull)
-    ax.plot(hx, [v * 100 for v in hy], color=pal["muted"], linewidth=1.2, zorder=2)
-    ax.annotate("random mix of single models", (hx[-1], hy[-1] * 100), xytext=(-6, -16),
-                textcoords="offset points", ha="right", color=pal["ink2"], fontsize=8.5)
+    ax.plot(hx, [v * 100 for v in hy], color=pal["muted"], linewidth=1.2, zorder=2,
+            label="Random mix of single models")
     for (name, env), color in zip(lines.items(), pal["series"]):
         xs, ys = zip(*env)
         ax.step(xs, [v * 100 for v in ys], where="post", color=color, linewidth=2, label=name, zorder=3,
                 solid_joinstyle="round", solid_capstyle="round")
         ax.plot(xs[-1], ys[-1] * 100, "o", color=color, markersize=7, markeredgecolor=pal["surface"],
                 markeredgewidth=2, zorder=4)
+    lo_x = min(x for x, _ in singles.values())
     for name, (x, yv) in singles.items():
         ax.plot(x, yv * 100, "o", color=pal["muted"], markersize=8, markeredgecolor=pal["surface"], markeredgewidth=2, zorder=5)
-        ax.annotate(name, (x, yv * 100), xytext=(6, -3), textcoords="offset points", color=pal["ink2"], fontsize=8.5)
+        ax.annotate(name, (x, yv * 100), xytext=(6, -3) if x > lo_x + 0.2 else (2, -15),
+                    textcoords="offset points", color=pal["ink2"], fontsize=8.5)
     for label, pt, marker in (("legacy router", legacy_pt, "s"), ("oracle", oracle_pt, "D")):
         if pt is None:
             continue
@@ -356,7 +384,11 @@ def main():
     ap.add_argument("--repeats", type=int, default=10)
     ap.add_argument("--conformal-splits", type=int, default=100)
     ap.add_argument("--bootstrap", type=int, default=500)
+    ap.add_argument("--models", nargs="*", default=None,
+                    help="restrict the model pool (default: every model in research/collect.py)")
     args = ap.parse_args()
+    if args.models:
+        MODELS[:] = args.models          # shared list: load_data and the policies see the same pool
 
     d, legacy, meta, recs, errors = load_data(args.run)
     n, M = d.y.shape
@@ -425,6 +457,14 @@ def main():
     report["bootstrap_auc_diff_95ci"] = {
         f"{a} minus Task table (classified intent)": bootstrap_auc_diff(d, P, a, "Task table (classified intent)", cost, lo, hi, args.bootstrap)
         for a in deployable if a != "Task table (classified intent)"}
+    report["bootstrap_auc_vs_random_mix_95ci"] = {
+        a: bootstrap_auc_vs_mix(d, P, a, cost, lo, hi, args.bootstrap) for a in deployable}
+
+    # ---- accuracy at matched latency: each single model's mean latency as the budget
+    report["accuracy_at_single_model_latency"] = {
+        name: {m: accuracy_at_budget(envelope([(p["lat"], p["acc"]) for p in pts]), float(lat_means[i]))
+               for i, m in enumerate(MODELS)}
+        for name, pts in {**curves, **ccurves}.items()}
 
     # ---- conformal cascade from the fastest decent small model
     cascade_small = max(smalls, key=lambda s: summary[f"Cascade {s} -> {best} (k=16)"]["auc"])
@@ -457,6 +497,20 @@ def main():
             f"Q{b + 1}": {m: float(d.y[bins == b, i].mean()) for i, m in enumerate(MODELS)} for b in range(5)},
         "routing_policy": best_learned, "lambda": lam_dep,
     }
+    # Routing by difficulty at the operating point whose mean latency is closest to the
+    # middle of [fastest model, most accurate model], averaged over all CV repeats
+    mid = (lo + hi) / 2
+    p_mid = min(curves[best_learned], key=lambda p: abs(p["lat"] - mid))
+    shares = np.zeros((5, M))
+    for r in range(P[best_learned].shape[0]):
+        c = choose(P[best_learned][r], cost, p_mid["lambda"])
+        for b in range(5):
+            shares[b] += [(c[bins == b] == i).mean() for i in range(M)]
+    shares /= P[best_learned].shape[0]
+    report["irt"]["mid_operating_point"] = {
+        "policy": best_learned, "lambda": p_mid["lambda"], "mean_latency_s": p_mid["lat"], "accuracy": p_mid["acc"],
+        "routing_by_difficulty_quintile": {f"Q{b + 1}": {m: float(shares[b, i]) for i, m in enumerate(MODELS)}
+                                           for b in range(5)}}
 
     # ---- deployable router: best learned policy at its operating point, plus cascade
     oof = P_ok[(cascade_small, 16)][0]
@@ -474,26 +528,37 @@ def main():
         art["estimator"] = {"type": "knn", "k": est.k, "temperature": est.t, "X": est.X.tolist(), "y": est.y.tolist()}
     elif isinstance(est, TaskTable):
         art["estimator"] = {"type": "table", **est.to_json()}
+    elif isinstance(est, EmbedLogReg):
+        art["estimator"] = {"type": "logreg", **est.to_json()}
     else:
-        art["estimator"] = {"type": "irt", **IRTRouter(dims=1).fit(d).to_json()}
-        art["note"] = f"{best_learned} is not serializable; deployed IRT 1-D instead"
+        # Never deploy a different estimator under this policy's name
+        raise RuntimeError(f"no serializer for {best_learned} ({type(est).__name__})")
     save_artifacts(ARTIFACT_PATH, **art)
     report["deployed"] = {"policy": art["policy"], "lambda": lam_dep, "cascade_tau": tau, "cascade_small": cascade_small}
 
     # ---- outputs
     RESULTS.mkdir(exist_ok=True)
     (RESULTS / "router_eval.json").write_text(json.dumps(report, indent=1))
-    lines = {
-        "Task table (classified intent)": envelope([(p["lat"], p["acc"]) for p in curves["Task table (classified intent)"]]),
-        "kNN (k=10)": envelope([(p["lat"], p["acc"]) for p in curves["kNN (k=10)"]]),
-        "IRT 1-D": envelope([(p["lat"], p["acc"]) for p in curves["IRT 1-D"]]),
-        "IRT + probe cascade": envelope([(p["lat"], p["acc"]) for p in ccurves["IRT + probe cascade"]]),
-    }
-    singles = {m: (float(lat_means[i]), float(acc[i])) for i, m in enumerate(MODELS)}
-    for theme in ("light", "dark"):
-        plot(RESULTS / f"router_frontier_{theme}.png", theme, singles, leg, oracle, hull, lines,
-             f"Accuracy vs. latency: routers vs. single models ({args.repeats}x5-fold cross-validation)")
+    make_plots(report)
     print_report(report)
+
+
+PLOT_LINES = ["Embedding logistic", "Task table (true task type)", "Task table (classified intent)",
+              "IRT + probe cascade"]
+
+
+def make_plots(report):
+    """Light and dark accuracy-vs-latency plots from a router_eval.json report."""
+    sm = report["single_models"]
+    singles = {m: (s["mean_latency_s"], s["accuracy"]) for m, s in sm.items()}
+    hull = upper_hull(list(singles.values()))
+    lines = {name: envelope([(p["lat"], p["acc"]) for p in report["curves"][name]]) for name in PLOT_LINES}
+    oracle_pt = (report["oracle"]["mean_latency_s"], report["oracle"]["accuracy"])
+    lg = report.get("legacy_router")
+    legacy_pt = (lg["mean_latency_s"], lg["accuracy"]) if lg else None
+    for theme in ("light", "dark"):
+        plot(RESULTS / f"router_frontier_{theme}.png", theme, singles, legacy_pt, oracle_pt, hull, lines,
+             f"Accuracy vs. latency: routers vs. single models ({report['repeats']}x5-fold cross-validation)")
 
 
 def print_report(r):
@@ -524,6 +589,18 @@ def print_report(r):
     print("Mean difficulty by task (same scale)", json.dumps(r["irt"]["mean_difficulty_by_task_centered"]))
     print("Routing by difficulty quintile", json.dumps(r["irt"]["routing_by_difficulty_quintile"], indent=1))
     print("Deployed:", r["deployed"])
+    print("\nBootstrap 95% CI of AUC minus random mix:")
+    for k, v in r["bootstrap_auc_vs_random_mix_95ci"].items():
+        print(f"  {k}: [{v[0]:+.4f}, {v[1]:+.4f}]")
+    print("\nAccuracy at each single model's mean latency (budget):")
+    for k, v in r["accuracy_at_single_model_latency"].items():
+        if k.startswith("Cascade") and "k=16" not in k:
+            continue
+        print(f"  {k}: " + ", ".join(f"{m} {('%.1f%%' % (100 * a)) if a is not None else '-'}" for m, a in v.items()))
+    mp = r["irt"]["mid_operating_point"]
+    print(f"\nMid operating point ({mp['policy']}, lambda {mp['lambda']:.4f}): accuracy {mp['accuracy']:.1%} "
+          f"at {mp['mean_latency_s']:.2f} s")
+    print(json.dumps(mp["routing_by_difficulty_quintile"], indent=1))
 
 
 if __name__ == "__main__":
